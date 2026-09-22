@@ -1,0 +1,13 @@
+{
+  "mode": "prioritize",
+  "tool": {
+    "path": "EDIT_SOURCE_TOOL_PATH",
+    "server": "EDIT_ENABLED_SERVER_NAME",
+    "args": { "query": "EDIT_ARGUMENTS_TO_MATCH_THE_ACTUAL_TOOL_SCHEMA" }
+  },
+  "resultPath": ["data", "structuredContent", "items"],
+  "fields": { "id": "id", "text": "snippet", "reference": "url" },
+  "task": "Choose one useful next source read about the already-formed hypothesis; retain mandatory evidence and abstain if unsupported.",
+  "mandatoryIds": [],
+  "limits": { "candidates": 6, "textBytes": 400, "totalBytes": 4096 }
+}

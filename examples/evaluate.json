@@ -1,0 +1,33 @@
+{
+  "mode": "evaluate",
+  "request": {
+    "state": {
+      "claim": "The proposed API response change preserves compatibility.",
+      "evidence": "Synthetic fixture: one consumer test passed; the old-client contract test was not run.",
+      "unknowns": ["Old-client behavior remains untested."]
+    },
+    "sources": [],
+    "questions": {
+      "supported": {
+        "type": "noul",
+        "instructions": "Does the supplied evidence support the compatibility claim? Judge only this bounded evidence.",
+        "true": "The claim is supported by the supplied evidence.",
+        "false": "The claim is not supported by the supplied evidence."
+      },
+      "next": {
+        "type": "choice",
+        "instructions": "Choose one useful next verification action, not a final approval.",
+        "options": {
+          "contract": "Run the old-client contract test.",
+          "none": "None of these actions is appropriate.",
+          "insufficient": "The state is insufficient to choose."
+        }
+      },
+      "coverage": {
+        "type": "score",
+        "instructions": "Assess evidence coverage using only these ordered levels; this is not authorization.",
+        "levels": ["No direct compatibility evidence", "Partial coverage with known gaps", "Relevant compatibility paths covered"]
+      }
+    }
+  }
+}

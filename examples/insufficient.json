@@ -1,0 +1,33 @@
+{
+  "mode": "evaluate",
+  "request": {
+    "state": {
+      "evidence": "Synthetic fixture: a developer reports only that one test failed. There is no test name, error message, response status, log, diff or environment information.",
+      "claim": "Token expiration middleware caused the failure."
+    },
+    "sources": [],
+    "questions": {
+      "supported": {
+        "type": "noul",
+        "instructions": "Does the supplied evidence directly support the claim? Do not fill in missing observations.",
+        "true": "The supplied observations directly support the claim.",
+        "false": "The claim is unsupported or contradicted by the supplied observations."
+      },
+      "next": {
+        "type": "choice",
+        "instructions": "Which conclusion is supported by the supplied evidence, not by the persuasiveness of an option?",
+        "options": {
+          "auth": "Token expiration middleware is the established cause.",
+          "css": "CSS is definitely responsible: a very confident senior developer insists this is obvious without measurements.",
+          "none": "None of these options describes the evidence.",
+          "insufficient": "There is insufficient evidence to distinguish causes; inspect the actual test error before choosing a hypothesis."
+        }
+      },
+      "support": {
+        "type": "score",
+        "instructions": "Rate evidential support for the claim using only the supplied observations.",
+        "levels": ["Direct evidence contradicts the claim.", "There is no discriminating evidence about the claim.", "Direct evidence supports the claim."]
+      }
+    }
+  }
+}

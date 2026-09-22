@@ -1,0 +1,189 @@
+{
+  "schema": "jev-helper-validation/v1",
+  "date": "2026-09-22",
+  "environment": {
+    "pi": "0.86.1",
+    "adapter": "2.36.0",
+    "node": "26.8.2",
+    "os": "Linux",
+    "mainModel": "openai-codex/gpt-6-astra",
+    "thinking": "high",
+    "jev": "jev-1.13.0"
+  },
+  "method": {
+    "samplesPerArm": 1,
+    "freshAgentSessions": true,
+    "providerCacheForcedCold": false,
+    "order": "baseline then helper",
+    "guard": "Exact allowed script once per agent session; read-only installed public resources; no retry or alternate transport",
+    "scope": "Synthetic fixture and public MCP snippets only; no repository, private memory or conversations uploaded",
+    "reasoning": "Native reasoning is a subset of output; do not add it again",
+    "tokens": "Sum native totalTokens per assistant message plus Jev input/output; different tokenizer units are not equal compute or monetary cost",
+    "cost": "SDK catalog estimates are unverified main-model-only metadata, NOT observed charges. Jev price and actual combined/subscription cost unavailable",
+    "limits": "One observation per arm, no randomized order, no general savings or calibrated-quality claim"
+  },
+  "comparisons": {
+    "publicSourceNextRead": {
+      "baseline": {
+        "mainCalls": 2,
+        "mainUsage": {
+          "input": 6084,
+          "output": 1010,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 7094
+        },
+        "mainSdkCatalogCostUsd": 0.11134,
+        "jevUsage": [],
+        "combinedReportedTokens": 7094,
+        "elapsedMs": 35401,
+        "toolCalls": 1,
+        "toolArgumentBytes": 3363,
+        "toolResultBytes": 5944,
+        "scriptBytes": 3289,
+        "scriptCalls": 1,
+        "modelErrors": 0,
+        "blockedCalls": 0,
+        "runtimeSubagents": 0,
+        "coverage": {
+          "sourceFingerprint": "fnv1a32:4260389807:12035",
+          "returned": 10,
+          "considered": 6,
+          "omitted": 4,
+          "truncated": 6
+        }
+      },
+      "helper": {
+        "mainCalls": 4,
+        "mainUsage": {
+          "input": 11231,
+          "output": 1396,
+          "cacheRead": 5248,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 17875
+        },
+        "mainSdkCatalogCostUsd": 0.187358,
+        "jevUsage": [
+          {
+            "inputTokens": 1248,
+            "outputTokens": 83
+          }
+        ],
+        "combinedReportedTokens": 19206,
+        "elapsedMs": 52671,
+        "toolCalls": 3,
+        "toolArgumentBytes": 4658,
+        "toolResultBytes": 13434,
+        "scriptBytes": 4407,
+        "scriptCalls": 1,
+        "modelErrors": 0,
+        "blockedCalls": 0,
+        "runtimeSubagents": 0,
+        "coverage": {
+          "sourceFingerprint": "fnv1a32:4260389807:12035",
+          "returned": 10,
+          "considered": 6,
+          "omitted": 4,
+          "truncated": 6
+        }
+      },
+      "quality": "Baseline chose c4 error guide; helper chose c1 low-level tool handler with confidence 0.29. Both references match tool-result errors and both retain clipping/omission uncertainty; no unique best-read ground truth or accuracy gain established. Identical noncryptographic corpus fingerprint and projection bounds."
+    },
+    "insufficientEvidence": {
+      "baseline": {
+        "mainCalls": 2,
+        "mainUsage": {
+          "input": 2222,
+          "output": 389,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "reasoning": 71,
+          "totalTokens": 2611
+        },
+        "mainSdkCatalogCostUsd": 0.04167,
+        "jevUsage": [],
+        "combinedReportedTokens": 2611,
+        "elapsedMs": 14983,
+        "toolCalls": 1,
+        "toolArgumentBytes": 86,
+        "toolResultBytes": 1767,
+        "scriptBytes": 0,
+        "scriptCalls": 0,
+        "modelErrors": 0,
+        "blockedCalls": 0,
+        "runtimeSubagents": 0,
+        "coverage": null
+      },
+      "helper": {
+        "mainCalls": 4,
+        "mainUsage": {
+          "input": 8502,
+          "output": 1051,
+          "cacheRead": 6016,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 15569
+        },
+        "mainSdkCatalogCostUsd": 0.143586,
+        "jevUsage": [
+          {
+            "inputTokens": 578,
+            "outputTokens": 81
+          }
+        ],
+        "combinedReportedTokens": 16228,
+        "elapsedMs": 39475,
+        "toolCalls": 4,
+        "toolArgumentBytes": 3321,
+        "toolResultBytes": 12733,
+        "scriptBytes": 2854,
+        "scriptCalls": 1,
+        "modelErrors": 0,
+        "blockedCalls": 0,
+        "runtimeSubagents": 0,
+        "coverage": null
+      },
+      "quality": "Both reject an unsupported cause, select insufficient and the middle no-discriminating-evidence rubric. Semantic decisions agree; baseline uses qualitative labels whereas helper also supplies Jev numbers/distributions. No exact output-schema equivalence claimed."
+    }
+  },
+  "otherValidation": {
+    "offlineTests": 125,
+    "packagedSdkLifecycle": "2 package extensions, 0 load errors; both skills discovered; simulated UI for doctor/setup; scoped CLI setup/idempotence/undo/reapply succeeded",
+    "nativeRunCommand": {
+      "mainCalls": 4,
+      "mainUsage": {
+        "input": 7411,
+        "output": 981,
+        "cacheRead": 6784,
+        "cacheWrite": 0,
+        "reasoning": 0,
+        "totalTokens": 15176
+      },
+      "mainSdkCatalogCostUsd": 0.129944,
+      "jevUsage": [
+        {
+          "inputTokens": 520,
+          "outputTokens": 71
+        }
+      ],
+      "combinedReportedTokens": 15767,
+      "elapsedMs": 36643,
+      "toolCalls": 4,
+      "toolArgumentBytes": 3002,
+      "toolResultBytes": 12692,
+      "scriptBytes": 2535,
+      "scriptCalls": 1,
+      "modelErrors": 0,
+      "blockedCalls": 0,
+      "runtimeSubagents": 0,
+      "coverage": null
+    },
+    "liveEvaluations": 7,
+    "liveBudget": 8,
+    "jevRetriesConfigured": 0,
+    "publicInstallAndCI": "Record in GitHub release notes after publication; not inferred from local tests"
+  },
+  "conclusion": "Both observed comparisons are more expensive with the helper. Prefer direct reasoning or deterministic projection for these small/already-visible inputs; use optional evaluation only when its extra structured signal justifies measured overhead."
+}

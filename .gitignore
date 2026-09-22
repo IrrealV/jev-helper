@@ -1,2 +1,9 @@
-# Local Pi runtime state
+# Local runtime, agent recovery notes and isolated validation state
 .atl/
+.pi/
+odd/
+.validation/
+node_modules/
+*.tgz
+.env
+.env.*

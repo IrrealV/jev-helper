@@ -1,0 +1,28 @@
+{
+  "name": "jev-helper",
+  "version": "0.1.0",
+  "description": "Bounded Jev decision scripts for Pi via pi-mcp-adapter",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "jev-helper": "bin/jev-helper.mjs"
+  },
+  "exports": {
+    ".": "./lib/script.mjs",
+    "./decisions": "./lib/decisions.mjs",
+    "./prioritize": "./lib/prioritize.mjs"
+  },
+  "keywords": ["pi-package", "pi", "jev", "mcp", "decision-support"],
+  "files": ["lib", "bin", "extensions", "skills", "docs", "examples", "README.md", "LICENSE"],
+  "pi": { "extensions": ["extensions/jev-helper.ts"], "skills": ["skills/jev-decisions"] },
+  "dependencies": { "jsonc-parser": "3.3.1" },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "peerDependenciesMeta": { "@earendil-works/pi-coding-agent": { "optional": true } },
+  "repository": { "type": "git", "url": "git+https://github.com/IrrealV/jev-helper.git" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
