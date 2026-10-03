@@ -13,7 +13,7 @@ console.log('Simulating orchestrator delegating 10 mixed tasks\n');
 const tasks = [
   { agent: 'gentle-ai-worker', description: 'Fix typo in README.md line 42', expected: 'fast-trivial' },
   { agent: 'gentle-ai-worker', description: 'Remove trailing whitespace from config.json', expected: 'fast-trivial' },
-  { agent: 'gentle-ai-worker', description: 'Rename variable userId to userId in auth.ts', expected: 'fast-trivial' },
+  { agent: 'gentle-ai-worker', description: 'Rename variable userId to accountId in auth.ts', expected: 'fast-trivial' },
   { agent: 'gentle-ai-explore', description: 'Find all TypeScript files in src directory', expected: 'fast-scan' },
   { agent: 'gentle-ai-explore', description: 'List all exported functions from utils module', expected: 'fast-scan' },
   { agent: 'gentle-ai-worker', description: 'Add input validation to user registration form', expected: 'balanced-simple' },
@@ -104,19 +104,38 @@ const savingsPercent = ((savings / totalTokensWithoutRouting) * 100).toFixed(1);
 
 console.log(`\nDirect token delta: ${(savings/1000).toFixed(0)}k tokens (${savingsPercent}% ${savings >= 0 ? 'reduction' : 'increase'})`);
 
-// Calculate "correctness benefit": avoid using wrong routes
-const trivialWithWrongRoute = 3; // 3 trivial tasks
-const complexWithWrongRoute = 1; // 1 complex task
-const trivialSavings = trivialWithWrongRoute * (15 - 5); // Save 10k per trivial
-const complexQualityValue = complexWithWrongRoute * 25; // Complex needs 40k not 15k (quality cost)
+// Calculate actual correctness benefit from real routing decisions
+let trivialRoutedCorrectly = 0;
+let trivialSavingsTotal = 0;
+let complexRoutedCorrectly = 0;
+
+for (const task of tasks) {
+  const result = selectJevRoute(task.agent, task.description);
+  const complexity = result.taskContext.estimatedComplexity;
+  
+  if (result.status === 'determined') {
+    // Trivial tasks should use fast-trivial (5k) not balanced-simple (15k)
+    if (complexity === 'trivial' && result.route === 'fast-trivial') {
+      trivialRoutedCorrectly++;
+      trivialSavingsTotal += 10; // 15k default - 5k fast = 10k saved
+    }
+    
+    // Complex tasks should use deep-complex (40k) not balanced-simple (15k)
+    if (complexity === 'complex' && result.route === 'deep-complex') {
+      complexRoutedCorrectly++;
+    }
+  }
+}
 
 console.log(`\n=== Correctness Benefit ===`);
-console.log(`Trivial tasks with cheap route: ${trivialWithWrongRoute} tasks × 10k saved = ${trivialSavings}k`);
-console.log(`Complex tasks with adequate resources: ${complexWithWrongRoute} task (40k vs 15k insufficient)`);
-console.log(`\nNet benefit: ${trivialSavings}k saved on trivial tasks`);
-console.log(`Quality gain: Complex task gets appropriate resources (40k vs 15k)`);
+console.log(`Trivial tasks with cheap route: ${trivialRoutedCorrectly} tasks × 10k saved = ${trivialSavingsTotal}k`);
+console.log(`Complex tasks with adequate resources: ${complexRoutedCorrectly} task(s) (40k vs 15k insufficient)`);
+console.log(`\nNet benefit: ${trivialSavingsTotal}k saved on trivial tasks`);
+if (complexRoutedCorrectly > 0) {
+  console.log(`Quality gain: ${complexRoutedCorrectly} complex task(s) get appropriate resources (40k vs 15k)`);
+}
 
-if (trivialSavings >= 20) {
+if (trivialSavingsTotal >= 20) {
   console.log(`\n✓✓✓ Excellent! Stage 1 saves tokens on cheap tasks and ensures quality on complex ones.`);
 } else if (trivialSavings >= 10) {
   console.log(`\n✓✓ Good! Stage 1 provides measurable benefit on cheap tasks.`);
@@ -143,4 +162,4 @@ for (const [route, count] of Object.entries(routeCounts).sort((a, b) => b[1] - a
 console.log('\n=== Integration test complete ===');
 
 // Exit with success if we have correctness benefit (trivial savings)
-process.exit(trivialSavings >= 10 ? 0 : 1);
+process.exit(trivialSavingsTotal >= 10 ? 0 : 1);
