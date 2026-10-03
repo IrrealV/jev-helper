@@ -138,7 +138,21 @@ Consult the route catalog to select the best delegation route.
 2. **User-global**: `~/.pi/jev-helper/route-catalog.json`
 3. **Extension default**: `node_modules/jev-helper/examples/route-catalog.json`
 
-The first existing catalog is used.
+The first existing catalog is used. If it cannot be read, parsed, or validated, selection throws instead of falling back to a lower-priority catalog.
+
+### Catalog cache and manual refresh
+
+A successfully loaded catalog and its source path are cached in memory for the lifetime of the loaded selector module, until explicitly cleared. Entries are keyed by normalized absolute project root; equivalent relative and absolute roots share an entry. Selection without a project root uses a separate entry.
+
+Cached selections do not check the filesystem again. Editing or deleting the catalog, or creating a higher-priority catalog, does not change an existing entry automatically.
+
+Use the exports from `skills/jev-route-selector/index.mjs` in the same process/module instance as selection:
+
+- `clearCatalogCache(projectRoot)` clears only that normalized project's entry.
+- `clearCatalogCache()` clears all entries, including selection without a project root. Use this when a shared user-global catalog changes and multiple project entries may retain it.
+- `getCatalogPath(projectRoot)` returns the cached source path, or `null` when no entry exists. Omit the argument to inspect the no-project entry. This is cached provenance, not a fresh filesystem lookup.
+
+After clearing, the next `selectJevRoute(agent, taskDescription, { projectRoot })` call re-runs location precedence and validation, so catalog changes take effect on that next selection. Clearing itself does not load a catalog. Failed loads are not cached.
 
 ### Catalog structure
 

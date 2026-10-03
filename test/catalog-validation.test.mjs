@@ -95,6 +95,42 @@ for (const pattern of [
   });
 }
 
+for (const [label, tokensPerTask] of [
+  ['NaN', NaN],
+  ['positive infinity', Infinity],
+  ['negative infinity', -Infinity],
+  ['zero', 0],
+  ['negative', -1],
+  ['numeric string', '1000'],
+  ['null', null],
+  ['boolean', true],
+  ['object', {}],
+  ['array', []],
+]) {
+  test(`rejects ${label} token estimates`, () => {
+    const catalog = makeCatalog();
+    catalog.agents.worker.routes[0].cost.tokensPerTask = tokensPerTask;
+
+    assert.deepEqual(validateCatalog(catalog), {
+      valid: false,
+      errors: ['Agent "worker": routes[0]: cost: "tokensPerTask" must be a positive number'],
+    });
+  });
+}
+
+for (const tokensPerTask of [Number.MIN_VALUE, 0.5, 1000, Number.MAX_VALUE]) {
+  test(`accepts finite positive token estimate ${tokensPerTask}`, () => {
+    const catalog = makeCatalog();
+    catalog.agents.worker.routes[0].cost.tokensPerTask = tokensPerTask;
+
+    assert.deepEqual(validateCatalog(catalog), { valid: true, errors: [] });
+  });
+}
+
+test('accepts omitted token estimates', () => {
+  assert.deepEqual(validateCatalog(makeCatalog()), { valid: true, errors: [] });
+});
+
 test('still detects duplicate route IDs and missing default routes', () => {
   const catalog = makeCatalog();
   catalog.agents.worker.routes.push(structuredClone(catalog.agents.worker.routes[0]));
