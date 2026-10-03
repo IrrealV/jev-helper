@@ -72,6 +72,8 @@ for (const [label, catalogPath] of [['project', projectPath], ['user', userPath]
   for (const [failure, content, expected] of [
     ['malformed JSON', '{ broken JSON', /Failed to parse catalog/],
     ['invalid schema', JSON.stringify({ version: 'unsupported' }), /Invalid catalog/],
+    ['overflowing token estimate', catalogWithModel('overflow-model').replace('"tokensPerTask":1000', '"tokensPerTask":1e309'),
+      /Invalid catalog.*"tokensPerTask" must be a positive number/],
     ['read error', Object.assign(new Error('Permission denied'), { code: 'EACCES' }), { code: 'EACCES' }],
   ]) {
     test(`rejects ${failure} in ${label} catalog without falling back`, t => {
@@ -168,6 +170,32 @@ test('shares and clears a cache entry across equivalent absolute and relative pa
   assert.equal(selectModel('project'), 'updated-model');
   clearCatalogCache();
   assert.equal(getCatalogPath(root), null);
+});
+
+test('ignores a newly created higher-priority catalog until explicitly cleared', t => {
+  const files = new Map([[userPath, catalogWithModel('user-model')]]);
+  const { exists, read } = mockCatalogFiles(t, files);
+
+  assert.equal(selectModel(projectRoot), 'user-model');
+  assert.equal(selectModel(), 'user-model');
+  const existsCalls = exists.mock.callCount();
+  const readCalls = read.mock.callCount();
+
+  files.set(projectPath, catalogWithModel('project-model'));
+  assert.equal(selectModel(projectRoot), 'user-model');
+  assert.equal(getCatalogPath(projectRoot), userPath);
+  assert.equal(exists.mock.callCount(), existsCalls);
+  assert.equal(read.mock.callCount(), readCalls);
+
+  clearCatalogCache(projectRoot);
+  assert.equal(getCatalogPath(projectRoot), null);
+  assert.equal(getCatalogPath(), userPath);
+  assert.equal(selectModel(projectRoot), 'project-model');
+  assert.equal(getCatalogPath(projectRoot), projectPath);
+
+  clearCatalogCache();
+  assert.equal(getCatalogPath(projectRoot), null);
+  assert.equal(getCatalogPath(), null);
 });
 
 for (const directory of ['my project', 'project #1 100% café']) {
