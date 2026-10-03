@@ -4,6 +4,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { test } from 'node:test';
 import { readFileSync } from 'fs';
 import { validateCatalog } from '../lib/catalog.mjs';
 import { extractTaskContext, selectRoute } from '../lib/routing.mjs';
@@ -268,4 +269,86 @@ for (const [keyword, description, shouldMatch] of [
 }
 console.log('✓ Route pattern and exclusion matching is boundary-aware\n');
 
-console.log('=== All tests passed ===');
+console.log('=== Legacy routing checks passed ===');
+
+test('task context retains short and Unicode words', () => {
+  assert.deepEqual(
+    extractTaskContext('go ui db 安全 データ co\u0301digo').keywords,
+    ['go', 'ui', 'db', '安全', 'データ', 'código']
+  );
+});
+
+// Exercise selection and exclusion independently so every bypass is reported.
+const keywordCases = [
+  ['go', 'Use Go for the service', true],
+  ['ui', 'Update the UI', true],
+  ['db', 'Check the DB connection', true],
+  ['安全', 'Check 安全 requirements', true],
+  ['データ', 'Process データ records', true],
+  ['código', 'Revisar CÓDIGO', true],
+  ['breaking change', 'A breaking change in the API', true],
+  ['code review', 'Perform code review today', true],
+  ['C++', 'Update the C++ implementation', true],
+  ['C#', 'Use C#', true],
+  ['Node.js', 'Upgrade Node.js today', true],
+  ['C++', '(C++), C++.', true],
+  ['C#', 'C#', true],
+  ['Node.js', 'Use (NODE.JS).', true],
+  ['Node.js upgrade', 'Plan a Node.js upgrade', true],
+  ['安全', '「安全」', true],
+  [' code review ', 'Perform code review', true],
+  ['breaking change', 'BREAKING\n\tCHANGE in the API', true],
+  ['código', 'Revisar co\u0301digo', true],
+  ['go', 'ongoing work', false],
+  ['ui', 'build the module', false],
+  ['db', 'sandbox update', false],
+  ['安全', 'Check 不安全 requirements', false],
+  ['データ', 'Process データベース records', false],
+  ['código', 'Revisar códigos', false],
+  ['go', 'Update égo', false],
+  ['go', 'Update go\u0301', false],
+  ['ui', 'Update ui_component', false],
+  ['breaking change', 'breaking API change', false],
+  ['breaking change', 'breaking algorithm.ts change', false],
+  ['code review', 'code, review', false],
+  ['code review', 'review code', false],
+  ['C++', 'Use C or C#', false],
+  ['C++', 'Use XC++ or C++Builder', false],
+  ['C#', 'Use C++', false],
+  ['Node.js', 'Upgrade NodeXjs', false],
+  ['Node.js', 'Upgrade MyNode.js', false],
+  ['format', 'Update format.js', false],
+  ['go', 'Update C:\\src\\go.ts', false],
+  ['código', 'Update código.ts', false],
+  ['algorithm', 'Update src/algorithm.ts', false],
+  ['breaking change', 'Do not breaking change; update docs', false],
+  ['   ', 'Update the service', false]
+];
+
+for (const [keyword, description, shouldMatch] of keywordCases) {
+  for (const exclusion of [false, true]) {
+    test(`${exclusion ? 'exclusion' : 'pattern'} ${JSON.stringify(keyword)} in ${JSON.stringify(description)}`, () => {
+      const keywordCatalog = {
+        agents: {
+          test: {
+            routes: [{
+              id: 'keyword-route',
+              suitability: {
+                description: 'Explicit catalog keyword',
+                taskPatterns: exclusion ? [{}] : [{ keywords: [keyword] }],
+                constraints: exclusion ? [{ excludeKeywords: [keyword] }] : []
+              }
+            }]
+          }
+        }
+      };
+
+      const result = selectRoute('test', description, keywordCatalog);
+
+      const suitable = exclusion ? !shouldMatch : shouldMatch;
+      assert.equal(result.resolution.status, suitable ? 'determined' : 'no-suitable-route');
+      if (suitable) assert.equal(result.resolution.route, 'keyword-route');
+    });
+  }
+}
+
