@@ -1,21 +1,47 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import extension from '../extensions/jev-helper.ts';
 
+const skillFile = fileURLToPath(new URL('../skills/jev-decisions/SKILL.md', import.meta.url));
+
 function host() {
-  const commands = new Map(); const messages = []; const notices = [];
+  const commands = new Map(); const messages = []; const sentOptions = []; const notices = [];
   const cwd = mkdtempSync(join(tmpdir(), 'jev-extension-'));
   const pi = {
     registerCommand: (name, command) => commands.set(name, command),
     getAllTools: () => [], getCommands: () => [], getActiveTools: () => [], getFlag: () => undefined,
-    sendUserMessage: message => messages.push(message),
+    sendUserMessage: (message, options) => { messages.push(message); sentOptions.push(options); },
   };
   const ctx = { cwd, hasUI: true, isIdle: () => true, isProjectTrusted: () => true, ui: { notify: message => notices.push(message), confirm: async () => false } };
-  return { pi, ctx, commands, messages, notices, cwd };
+  return { pi, ctx, commands, messages, sentOptions, notices, cwd };
 }
+
+function configureRun(h) {
+  const root = join(h.cwd, 'adapter');
+  mkdirSync(root);
+  writeFileSync(join(root, 'package.json'), '{"name":"pi-mcp-adapter","version":"2.36.0","type":"module","exports":{"./config":"./config.mjs"}}');
+  const target = join(h.cwd, 'mcp.json');
+  writeFileSync(target, '{"settings":{"jev":{"scriptEvaluation":true,"allowedServers":[]}},"mcpServers":{}}');
+  writeFileSync(join(root, 'config.mjs'), `export const getConfigDiscoveryPaths = () => [{path:${JSON.stringify(target)}}]; export const loadMcpConfig = () => (${JSON.stringify({ settings: { jev: { scriptEvaluation: true, allowedServers: [] } }, mcpServers: {} })});`);
+  h.pi.getAllTools = () => [{ name: 'mcpScript', sourceInfo: { path: join(root, 'index.ts'), source: 'npm:pi-mcp-adapter', scope: 'user', origin: 'package' } }];
+  h.pi.getActiveTools = () => ['mcpScript'];
+  const spec = join(h.cwd, 'spec.json');
+  writeFileSync(spec, JSON.stringify({ mode: 'evaluate', request: { state: { evidence: 'synthetic only' }, sources: [], questions: { next: { type: 'noul', instructions: 'Does the supplied evidence support the claim?' } } } }));
+  return spec;
+}
+
+function plantFile(target, contents = 'fixture') {
+  mkdirSync(join(target, '..'), { recursive: true });
+  writeFileSync(target, contents);
+  return target;
+}
+
+const SKILL_COMMAND = { name: 'skill:jev-decisions', source: 'skill', sourceInfo: { path: skillFile } };
+const FOREIGN_COMMAND = { name: 'skill:jev-decisions', source: 'skill', sourceInfo: { path: '/opt/other/skills/jev-decisions/SKILL.md' } };
 
 test('extension registers only four commands; installation does not call tools or send context', () => {
   const h = host();
@@ -43,23 +69,112 @@ test('setup needs explicit scope and UI confirmation; cancellation never resolve
 
 test('run sends only a validated script request on explicit command, through the existing tool', async () => {
   const h = host();
-  const root = join(h.cwd, 'adapter');
-  const { mkdirSync } = await import('node:fs'); mkdirSync(root);
-  writeFileSync(join(root, 'package.json'), '{"name":"pi-mcp-adapter","version":"2.36.0","type":"module","exports":{"./config":"./config.mjs"}}');
-  const target = join(h.cwd, 'mcp.json');
-  writeFileSync(target, '{"settings":{"jev":{"scriptEvaluation":true,"allowedServers":[]}},"mcpServers":{}}');
-  writeFileSync(join(root, 'config.mjs'), `export const getConfigDiscoveryPaths = () => [{path:${JSON.stringify(target)}}]; export const loadMcpConfig = () => (${JSON.stringify({ settings: { jev: { scriptEvaluation: true, allowedServers: [] } }, mcpServers: {} })});`);
-  h.pi.getAllTools = () => [{ name: 'mcpScript', sourceInfo: { path: join(root, 'index.ts'), source: 'npm:pi-mcp-adapter', scope: 'user', origin: 'package' } }];
-  h.pi.getActiveTools = () => ['mcpScript'];
-  const spec = join(h.cwd, 'spec.json');
-  writeFileSync(spec, JSON.stringify({ mode: 'evaluate', request: { state: { evidence: 'synthetic only' }, sources: [], questions: { next: { type: 'noul', instructions: 'Does the supplied evidence support the claim?' } } } }));
+  const spec = configureRun(h);
   extension(h.pi, async () => ({ getAgentDir: () => h.cwd, CONFIG_DIR_NAME: '.pi', VERSION: '0.86.1' }));
   await h.commands.get('jev-run').handler('spec.json', h.ctx);
   assert.equal(h.messages.length, 1);
   assert.match(h.messages[0], /mcpScript/);
   assert.match(h.messages[0], /jev.evaluate/);
   assert.match(h.messages[0], /untrusted/);
+  assert.equal(h.messages[0].startsWith('/skill:'), false);
+  assert.equal(h.sentOptions[0]?.expandPromptTemplates === true, false);
   assert.equal(h.messages[0].includes(h.cwd), false);
+  assert.equal(h.messages[0].includes(spec), false);
+});
+
+test('run expands the discovered jev-decisions skill for complete prepared code only', async () => {
+  const h = host();
+  const spec = configureRun(h);
+  h.pi.getCommands = () => [SKILL_COMMAND, { name: 'skill:other', source: 'skill', sourceInfo: { path: '/opt/other/SKILL.md' } }];
+  extension(h.pi, async () => ({ getAgentDir: () => h.cwd, CONFIG_DIR_NAME: '.pi', VERSION: '0.86.1' }));
+  await h.commands.get('jev-run').handler('spec.json', h.ctx);
+  assert.equal(h.messages.length, 1);
+  assert.equal(h.messages[0].startsWith('/skill:jev-decisions '), true);
+  assert.equal(h.sentOptions[0]?.expandPromptTemplates, true);
+  assert.match(h.messages[0], /complete/i);
+  assert.match(h.messages[0], /prepared/i);
+  assert.match(h.messages[0], /mcpScript/);
+  assert.match(h.messages[0], /jev\.evaluate/);
+  assert.match(h.messages[0], /untrusted/);
+  assert.equal(h.messages[0].includes(h.cwd), false);
+  assert.equal(h.messages[0].includes(spec), false);
+  assert.match(h.messages[0], /do not\s+re-read|skip optional/i);
+});
+
+for (const [label, commands] of [
+  ['absent', []],
+  ['only an extension command', [{ name: 'jev-decisions', source: 'extension', sourceInfo: { path: '/opt/jev-decisions.ts' } }]],
+  ['a differently named skill', [{ name: 'skill:other', source: 'skill', sourceInfo: { path: '/opt/other/SKILL.md' } }]],
+]) {
+  test(`run falls back to a plain guarded prepared request when the skill is ${label}`, async () => {
+    const h = host();
+    configureRun(h);
+    h.pi.getCommands = () => commands;
+    extension(h.pi, async () => ({ getAgentDir: () => h.cwd, CONFIG_DIR_NAME: '.pi', VERSION: '0.86.1' }));
+    await h.commands.get('jev-run').handler('spec.json', h.ctx);
+    assert.equal(h.messages.length, 1);
+    assert.equal(h.messages[0].startsWith('/skill:'), false);
+    assert.equal(h.sentOptions[0]?.expandPromptTemplates === true, false);
+    assert.match(h.messages[0], /mcpScript/);
+    assert.match(h.messages[0], /jev\.evaluate/);
+    assert.match(h.messages[0], /untrusted/);
+  });
+}
+
+test('run rejects a foreign package skill that only shares the directory suffix', async () => {
+  const h = host();
+  configureRun(h);
+  const foreign = plantFile(join(h.cwd, 'foreign', 'skills', 'jev-decisions', 'SKILL.md'));
+  h.pi.getCommands = () => [{ ...FOREIGN_COMMAND, sourceInfo: { path: foreign } }];
+  extension(h.pi, async () => ({ getAgentDir: () => h.cwd, CONFIG_DIR_NAME: '.pi', VERSION: '0.86.1' }));
+  await h.commands.get('jev-run').handler('spec.json', h.ctx);
+  assert.equal(h.messages[0].startsWith('/skill:'), false);
+  assert.equal(h.sentOptions[0]?.expandPromptTemplates === true, false);
+});
+
+test('run rejects a misleading not-skills suffix that is not this package', async () => {
+  const h = host();
+  configureRun(h);
+  const misleading = plantFile(join(h.cwd, 'not-skills', 'jev-decisions', 'SKILL.md'));
+  h.pi.getCommands = () => [{ ...FOREIGN_COMMAND, sourceInfo: { path: misleading } }];
+  extension(h.pi, async () => ({ getAgentDir: () => h.cwd, CONFIG_DIR_NAME: '.pi', VERSION: '0.86.1' }));
+  await h.commands.get('jev-run').handler('spec.json', h.ctx);
+  assert.equal(h.messages[0].startsWith('/skill:'), false);
+  assert.equal(h.sentOptions[0]?.expandPromptTemplates === true, false);
+});
+
+for (const [label, build] of [
+  ['two same-name foreign entries', h => [
+    { ...FOREIGN_COMMAND, sourceInfo: { path: plantFile(join(h.cwd, 'a', 'skills', 'jev-decisions', 'SKILL.md')) } },
+    { ...FOREIGN_COMMAND, sourceInfo: { path: plantFile(join(h.cwd, 'b', 'skills', 'jev-decisions', 'SKILL.md')) } },
+  ]],
+  ['the genuine entry plus a foreign duplicate', h => [
+    SKILL_COMMAND,
+    { ...FOREIGN_COMMAND, sourceInfo: { path: plantFile(join(h.cwd, 'a', 'skills', 'jev-decisions', 'SKILL.md')) } },
+  ]],
+]) {
+  test(`run fails closed on ${label}`, async () => {
+    const h = host();
+    configureRun(h);
+    h.pi.getCommands = () => build(h);
+    extension(h.pi, async () => ({ getAgentDir: () => h.cwd, CONFIG_DIR_NAME: '.pi', VERSION: '0.86.1' }));
+    await h.commands.get('jev-run').handler('spec.json', h.ctx);
+    assert.equal(h.messages.length, 1);
+    assert.equal(h.messages[0].startsWith('/skill:'), false);
+    assert.equal(h.sentOptions[0]?.expandPromptTemplates === true, false);
+  });
+}
+
+test('run expands a symlink that resolves to this package skill', async () => {
+  const h = host();
+  configureRun(h);
+  const link = join(h.cwd, 'skill-link.md');
+  symlinkSync(skillFile, link);
+  h.pi.getCommands = () => [{ ...SKILL_COMMAND, sourceInfo: { path: link } }];
+  extension(h.pi, async () => ({ getAgentDir: () => h.cwd, CONFIG_DIR_NAME: '.pi', VERSION: '0.86.1' }));
+  await h.commands.get('jev-run').handler('spec.json', h.ctx);
+  assert.equal(h.messages[0].startsWith('/skill:jev-decisions '), true);
+  assert.equal(h.sentOptions[0]?.expandPromptTemplates, true);
 });
 
 test('doctor and confirmed setup accept a standard adapter alongside its skills and prompts', async () => {

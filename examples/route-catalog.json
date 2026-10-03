@@ -1,0 +1,123 @@
+{
+  "version": "1.0.0",
+  "agents": {
+    "gentle-ai-worker": {
+      "identity": "gentle-ai-worker",
+      "description": "Bounded implementation worker for well-scoped changes",
+      "routes": [
+        {
+          "id": "fast-trivial",
+          "model": "gemini-2.0-flash-thinking-exp-01-21",
+          "thinking": "low",
+          "suitability": {
+            "description": "Trivial mechanical changes with clear instructions",
+            "taskPatterns": [
+              {
+                "keywords": ["typo", "rename", "format", "indent", "whitespace", "trailing", "spelling"],
+                "maxComplexity": "trivial",
+                "scope": ["read-only", "single-file"]
+              }
+            ],
+            "constraints": [
+              {
+                "excludeKeywords": ["refactor", "architecture", "design", "algorithm"]
+              }
+            ]
+          },
+          "cost": {
+            "relative": "very-low",
+            "tokensPerTask": 5000
+          }
+        },
+        {
+          "id": "balanced-simple",
+          "model": "gemini-2.0-flash-thinking-exp-01-21",
+          "thinking": "medium",
+          "suitability": {
+            "description": "Simple well-defined changes with local reasoning",
+            "taskPatterns": [
+              {
+                "maxComplexity": "simple",
+                "scope": ["single-file", "multi-file"]
+              }
+            ],
+            "constraints": [
+              {
+                "excludeKeywords": ["typo", "whitespace", "trailing", "indent", "format"]
+              }
+            ]
+          },
+          "cost": {
+            "relative": "low",
+            "tokensPerTask": 15000
+          }
+        },
+        {
+          "id": "deep-complex",
+          "model": "gemini-2.0-flash-thinking-exp-01-21",
+          "thinking": "high",
+          "suitability": {
+            "description": "Complex changes requiring deep reasoning or cross-package coordination",
+            "taskPatterns": [
+              {
+                "requiresComplexity": "complex"
+              },
+              {
+                "requiresComplexity": "moderate",
+                "scope": ["cross-package"]
+              }
+            ]
+          },
+          "cost": {
+            "relative": "medium",
+            "tokensPerTask": 40000
+          }
+        }
+      ],
+      "defaultRoute": "balanced-simple"
+    },
+    "gentle-ai-explore": {
+      "identity": "gentle-ai-explore",
+      "description": "Read-only exploration and discovery",
+      "routes": [
+        {
+          "id": "fast-scan",
+          "model": "gemini-2.0-flash-thinking-exp-01-21",
+          "thinking": "low",
+          "suitability": {
+            "description": "Quick scans for known patterns or simple discovery",
+            "taskPatterns": [
+              {
+                "keywords": ["find", "locate", "list", "count"],
+                "maxComplexity": "simple"
+              }
+            ]
+          },
+          "cost": {
+            "relative": "very-low",
+            "tokensPerTask": 3000
+          }
+        },
+        {
+          "id": "deep-analysis",
+          "model": "gemini-2.0-flash-thinking-exp-01-21",
+          "thinking": "high",
+          "suitability": {
+            "description": "Complex analysis requiring understanding of relationships and implications",
+            "taskPatterns": [
+              {
+                "keywords": ["analyze", "investigate", "understand", "trace"],
+                "requiresComplexity": "moderate"
+              }
+            ]
+          },
+          "cost": {
+            "relative": "low",
+            "tokensPerTask": 12000
+          }
+        }
+      ],
+      "defaultRoute": "fast-scan"
+    }
+  }
+}
