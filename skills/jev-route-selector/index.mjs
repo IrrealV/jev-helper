@@ -54,14 +54,12 @@ function loadCatalog(projectRoot) {
         catalogCache.set(cacheKey, { catalog, path });
         return catalog;
       } catch (error) {
-        // JSON parse errors or validation errors are fatal for this path
+        // Fail closed: only a missing catalog may fall through to a lower-priority path.
         console.error(`Failed to load catalog from ${path}:`, error.message);
-        // Don't continue - if a catalog exists but is invalid, that's an error
-        if (error.message.includes('Invalid catalog')) {
-          throw error;
+        if (error instanceof SyntaxError) {
+          throw new Error(`Failed to parse catalog at ${path}: ${error.message}`, { cause: error });
         }
-        // For other errors (file read, parse), continue to next path
-        continue;
+        throw error;
       }
     }
   }
