@@ -46,15 +46,21 @@ function loadCatalog(projectRoot) {
         const validation = validateCatalog(catalog);
         
         if (!validation.valid) {
-          console.warn(`Invalid catalog at ${path}:`, validation.errors);
-          continue;
+          // Fail closed: reject invalid catalog instead of silently falling back
+          throw new Error(`Invalid catalog at ${path}: ${validation.errors.join('; ')}`);
         }
         
         // Cache with key
         catalogCache.set(cacheKey, { catalog, path });
         return catalog;
       } catch (error) {
-        console.warn(`Failed to load catalog from ${path}:`, error.message);
+        // JSON parse errors or validation errors are fatal for this path
+        console.error(`Failed to load catalog from ${path}:`, error.message);
+        // Don't continue - if a catalog exists but is invalid, that's an error
+        if (error.message.includes('Invalid catalog')) {
+          throw error;
+        }
+        // For other errors (file read, parse), continue to next path
         continue;
       }
     }
