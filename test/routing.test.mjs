@@ -271,6 +271,32 @@ console.log('✓ Route pattern and exclusion matching is boundary-aware\n');
 
 console.log('=== Legacy routing checks passed ===');
 
+for (const agent of ['toString', 'constructor', '__proto__', 'valueOf']) {
+  test(`inherited agent name ${agent} returns no suitable route`, () => {
+    const result = selectRoute(agent, 'Update the module', catalog);
+
+    assert.equal(result.resolution.status, 'no-suitable-route');
+    assert.equal(result.resolution.reason, `Agent "${agent}" not found in catalog`);
+  });
+
+  test(`explicitly configured agent ${agent} can still select a route`, () => {
+    const ownCatalog = { agents: { [agent]: catalog.agents['gentle-ai-worker'] } };
+
+    const result = selectRoute(agent, 'Fix typo', ownCatalog);
+
+    assert.equal(result.resolution.status, 'determined');
+    assert.equal(result.resolution.route, 'fast-trivial');
+  });
+}
+
+for (const agents of [undefined, null]) {
+  test(`missing agents (${agents}) returns no suitable route`, () => {
+    const result = selectRoute('unknown-agent', 'Update the module', { agents });
+
+    assert.equal(result.resolution.status, 'no-suitable-route');
+  });
+}
+
 for (const complexity of ['COMPLEX', 'INVALID', null, 42, undefined, '', false]) {
   test(`rejects explicit invalid complexity ${JSON.stringify(complexity)} before routing`, () => {
     assert.throws(

@@ -99,7 +99,7 @@ function getRouteDetails(catalog, agent, routeId) {
  * @returns {object} Formatted options
  */
 function formatRouteOptions(catalog, agent, routeIds) {
-  const options = {};
+  const options = Object.create(null);
   
   for (const routeId of routeIds) {
     const details = getRouteDetails(catalog, agent, routeId);

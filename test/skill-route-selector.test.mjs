@@ -5,6 +5,9 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { join } from 'node:path';
 import { selectJevRoute, clearCatalogCache, getCatalogPath } from '../skills/jev-route-selector/index.mjs';
 
 console.log('=== jev-route-selector Skill Tests ===\n');
@@ -132,6 +135,60 @@ if (catalogPath1 === catalogPath2) {
 }
 
 console.log('=== Legacy skill checks passed ===');
+
+for (const routeId of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+  test(`ambiguous route options preserve ${routeId} through JSON serialization`, t => {
+    const projectRoot = '/virtual/route-options-test';
+    const catalogPath = join(projectRoot, '.pi', 'jev-helper', 'route-catalog.json');
+    const routeIds = [routeId, 'ordinary-route'];
+    const catalog = {
+      version: '1.0.0',
+      agents: {
+        test: {
+          identity: 'test',
+          description: 'Route option regression fixture',
+          routes: routeIds.map(id => ({
+            id,
+            model: 'test-model',
+            thinking: 'low',
+            suitability: {
+              description: `Option ${id}`,
+              taskPatterns: [{ maxComplexity: 'simple' }]
+            },
+            cost: { tokensPerTask: 1000, relative: 'low' }
+          }))
+        }
+      }
+    };
+    clearCatalogCache(projectRoot);
+    t.after(() => {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+      clearCatalogCache(projectRoot);
+    });
+    // Supply a catalog in memory without touching local or user-global files.
+    t.mock.method(fs, 'existsSync', path => path === catalogPath);
+    t.mock.method(fs, 'readFileSync', (path, encoding) => {
+      assert.equal(path, catalogPath);
+      assert.equal(encoding, 'utf8');
+      return JSON.stringify(catalog);
+    });
+    syncBuiltinESMExports();
+
+    const result = selectJevRoute('test', 'Update the module', { projectRoot });
+
+    assert.equal(result.status, 'ambiguous');
+    assert.deepEqual(result.suitableRoutes, routeIds);
+    const serialized = JSON.parse(JSON.stringify(result));
+    for (const options of [result.routeOptions, serialized.routeOptions]) {
+      assert.deepEqual(Object.keys(options), routeIds);
+      for (const id of routeIds) {
+        assert.equal(Object.hasOwn(options, id), true);
+        assert.equal(options[id], `low thinking, ~1k tokens: Option ${id}`);
+      }
+    }
+  });
+}
 
 for (const nested of [false, true]) {
   const api = nested ? 'nested' : 'direct';
