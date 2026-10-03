@@ -329,6 +329,84 @@ test('task context retains short and Unicode words', () => {
   );
 });
 
+// Mutation verbs must override read-only indicators, retaining extent-based scopes.
+const mutationDescriptions = [
+  'Find and delete obsolete files',
+  'Find and remove obsolete code',
+  'Read the requirements and write the module',
+  'Read the requirements and create a module',
+  'Find and update the handler',
+  'Locate and modify the handler',
+  'Search for and edit the handler',
+  'Read the requirements and implement the handler',
+  'Read the requirements and add feature support',
+  'Read the module and add function helpers',
+  'Find and fix bug in auth',
+  'Find and fix auth bug',
+  'Read the requirements and build the module',
+  'Read the schema and generate the client',
+  'Find and refactor the handler',
+  'Find and change the handler',
+  'FIND the handler; DELETE obsolete code',
+  // Even a minor correction writes content; complexity is separate from scope.
+  'Read the documentation and fix typo'
+];
+
+for (const description of mutationDescriptions) {
+  test(`mutation blocks read-only scope: ${description}`, () => {
+    assert.equal(extractTaskContext(description).scope, 'single-file');
+  });
+}
+
+for (const [description, scope] of [
+  ['Find and delete obsolete code across packages', 'cross-package'],
+  ['Read and update multiple files', 'multi-file'],
+  ['Read and analyze', 'read-only'],
+  ['Fix typo', 'single-file'],
+  ['Fix auth bug', 'single-file'],
+  ['Read the address, credit, and prefix documentation', 'read-only'],
+  ['Read delete.ts and src/update.js', 'read-only'],
+  ['Read the module; do not delete it', 'read-only'],
+  ["Find the module; don't update it", 'read-only'],
+  ['Read the module; avoid write operations', 'read-only'],
+  ['Read the module; do not delete it, but update the handler', 'single-file']
+]) {
+  test(`scope edge case: ${description}`, () => {
+    assert.equal(extractTaskContext(description).scope, scope);
+  });
+}
+
+for (const constraint of [false, true]) {
+  test(`mutations cannot select a read-only ${constraint ? 'constraint' : 'pattern'} route`, () => {
+    const readOnlyCatalog = {
+      agents: {
+        test: {
+          routes: [{
+            id: 'read-only-route',
+            suitability: {
+              description: 'Read-only work',
+              taskPatterns: constraint ? [{}] : [{ scope: ['read-only'] }],
+              constraints: constraint ? [{ requiresScope: ['read-only'] }] : []
+            }
+          }]
+        }
+      }
+    };
+
+    assert.equal(
+      selectRoute('test', 'Read and analyze', readOnlyCatalog).resolution.status,
+      'determined'
+    );
+    for (const description of mutationDescriptions) {
+      assert.equal(
+        selectRoute('test', description, readOnlyCatalog).resolution.status,
+        'no-suitable-route',
+        description
+      );
+    }
+  });
+}
+
 // Exercise selection and exclusion independently so every bypass is reported.
 const keywordCases = [
   ['go', 'Use Go for the service', true],
