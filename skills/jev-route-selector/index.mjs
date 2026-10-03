@@ -99,7 +99,7 @@ function getRouteDetails(catalog, agent, routeId) {
  * @returns {object} Formatted options
  */
 function formatRouteOptions(catalog, agent, routeIds) {
-  const options = {};
+  const options = Object.create(null);
   
   for (const routeId of routeIds) {
     const details = getRouteDetails(catalog, agent, routeId);
@@ -118,13 +118,13 @@ function formatRouteOptions(catalog, agent, routeIds) {
  * Select optimal delegation route
  * @param {string} agent - Agent identity
  * @param {string} taskDescription - Task description
- * @param {object} [options] - Options
+ * @param {object} [options] - Options or direct task hints (complexity, scope, priority)
  * @param {string} [options.projectRoot] - Project root for catalog lookup
- * @param {object} [options.hints] - Task hints (complexity, scope, priority)
+ * @param {object} [options.hints] - Nested task hints; takes precedence over direct hints
  * @returns {object} Selection result
  */
 export function selectJevRoute(agent, taskDescription, options = {}) {
-  const { projectRoot, hints } = options;
+  const { projectRoot, hints = options } = options;
   
   // Load catalog (cached per projectRoot)
   const catalog = loadCatalog(projectRoot);
