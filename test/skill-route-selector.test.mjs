@@ -3,6 +3,8 @@
  * Tests for jev-route-selector skill
  */
 
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
 import { selectJevRoute, clearCatalogCache, getCatalogPath } from '../skills/jev-route-selector/index.mjs';
 
 console.log('=== jev-route-selector Skill Tests ===\n');
@@ -129,4 +131,53 @@ if (catalogPath1 === catalogPath2) {
   process.exit(1);
 }
 
-console.log('=== All skill tests passed ===');
+console.log('=== Legacy skill checks passed ===');
+
+for (const nested of [false, true]) {
+  const api = nested ? 'nested' : 'direct';
+
+  test(`${api} complexity hints select the complex route for a simple description`, () => {
+    const hints = { complexity: 'complex' };
+    const result = selectJevRoute(
+      'gentle-ai-worker', 'Update the module', nested ? { hints } : hints
+    );
+
+    assert.equal(result.route, 'deep-complex');
+    assert.equal(result.status, 'determined');
+    assert.equal(result.taskContext.estimatedComplexity, 'complex');
+  });
+
+  test(`${api} scope and priority hints are preserved`, () => {
+    const hints = { scope: 'cross-package', priority: 'high' };
+    const result = selectJevRoute(
+      'gentle-ai-worker', 'Investigate the module', nested ? { hints } : hints
+    );
+
+    assert.equal(result.route, 'deep-complex');
+    assert.equal(result.status, 'determined');
+    assert.equal(result.taskContext.scope, 'cross-package');
+    assert.equal(result.taskContext.priority, 'high');
+  });
+
+  for (const complexity of ['COMPLEX', 'INVALID', null, 42, undefined]) {
+    test(`${api} API rejects invalid complexity ${JSON.stringify(complexity)}`, () => {
+      const hints = { complexity };
+      assert.throws(
+        () => selectJevRoute('gentle-ai-worker', 'Update the module', nested ? { hints } : hints),
+        { name: 'TypeError', message: /complexity.*trivial.*simple.*moderate.*complex/i }
+      );
+    });
+  }
+}
+
+test('nested hints take precedence over direct hints without merging', () => {
+  const result = selectJevRoute('gentle-ai-worker', 'Update the module', {
+    complexity: 'simple',
+    priority: 'high',
+    hints: { complexity: 'complex' }
+  });
+
+  assert.equal(result.route, 'deep-complex');
+  assert.equal(result.taskContext.estimatedComplexity, 'complex');
+  assert.equal(result.taskContext.priority, 'normal');
+});

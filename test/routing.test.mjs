@@ -271,6 +271,31 @@ console.log('✓ Route pattern and exclusion matching is boundary-aware\n');
 
 console.log('=== Legacy routing checks passed ===');
 
+for (const complexity of ['COMPLEX', 'INVALID', null, 42, undefined, '', false]) {
+  test(`rejects explicit invalid complexity ${JSON.stringify(complexity)} before routing`, () => {
+    assert.throws(
+      () => selectRoute('gentle-ai-worker', 'Update the module', catalog, { complexity }),
+      { name: 'TypeError', message: /complexity.*trivial.*simple.*moderate.*complex/i }
+    );
+  });
+}
+
+for (const complexity of ['trivial', 'simple', 'moderate', 'complex']) {
+  test(`preserves valid ${complexity} complexity hints`, () => {
+    const result = selectRoute('gentle-ai-worker', 'Update the module', catalog, { complexity });
+    assert.equal(result.taskContext.estimatedComplexity, complexity);
+  });
+}
+
+test('estimates complexity only when the hint is omitted', () => {
+  for (const hints of [undefined, {}, { priority: 'normal' }]) {
+    const result = selectRoute('gentle-ai-worker', 'Refactor the module', catalog, hints);
+    assert.equal(result.taskContext.estimatedComplexity, 'complex');
+    assert.equal(result.resolution.status, 'determined');
+    assert.equal(result.resolution.route, 'deep-complex');
+  }
+});
+
 test('task context retains short and Unicode words', () => {
   assert.deepEqual(
     extractTaskContext('go ui db 安全 データ co\u0301digo').keywords,
