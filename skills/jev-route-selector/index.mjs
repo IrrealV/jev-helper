@@ -4,12 +4,18 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { homedir } from 'os';
+import { fileURLToPath } from 'url';
 import { selectRoute } from '../../lib/routing.mjs';
 import { validateCatalog } from '../../lib/catalog.mjs';
 
-let catalogCache = new Map(); // Cache per projectRoot
+const catalogCache = new Map(); // Cache per absolute project root
+const noProjectCacheKey = Symbol('no-project');
+
+function getCatalogCacheKey(projectRoot) {
+  return projectRoot ? resolve(projectRoot) : noProjectCacheKey;
+}
 
 /**
  * Load route catalog from standard locations
@@ -18,7 +24,7 @@ let catalogCache = new Map(); // Cache per projectRoot
  */
 function loadCatalog(projectRoot) {
   // Check cache first
-  const cacheKey = projectRoot || 'default';
+  const cacheKey = getCatalogCacheKey(projectRoot);
   if (catalogCache.has(cacheKey)) {
     const cached = catalogCache.get(cacheKey);
     return cached.catalog;
@@ -31,12 +37,12 @@ function loadCatalog(projectRoot) {
   const searchPaths = [];
   
   if (projectRoot) {
-    searchPaths.push(join(projectRoot, '.pi', 'jev-helper', 'route-catalog.json'));
+    searchPaths.push(join(cacheKey, '.pi', 'jev-helper', 'route-catalog.json'));
   }
   
   searchPaths.push(
     join(homedir(), '.pi', 'jev-helper', 'route-catalog.json'),
-    join(new URL('.', import.meta.url).pathname, '../../examples/route-catalog.json')
+    fileURLToPath(new URL('../../examples/route-catalog.json', import.meta.url))
   );
 
   for (const path of searchPaths) {
@@ -173,7 +179,7 @@ export function selectJevRoute(agent, taskDescription, options = {}) {
  */
 export function clearCatalogCache(projectRoot) {
   if (projectRoot) {
-    catalogCache.delete(projectRoot);
+    catalogCache.delete(getCatalogCacheKey(projectRoot));
   } else {
     catalogCache.clear();
   }
@@ -185,7 +191,7 @@ export function clearCatalogCache(projectRoot) {
  * @returns {string|null} Catalog path or null if not loaded
  */
 export function getCatalogPath(projectRoot) {
-  const cacheKey = projectRoot || 'default';
+  const cacheKey = getCatalogCacheKey(projectRoot);
   const cached = catalogCache.get(cacheKey);
   return cached?.path || null;
 }
