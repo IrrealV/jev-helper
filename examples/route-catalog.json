@@ -43,7 +43,7 @@
             ],
             "constraints": [
               {
-                "excludeKeywords": ["typo", "whitespace", "trailing", "indent", "format"]
+                "excludeKeywords": ["typo", "whitespace", "trailing", "indent", "format", "rename", "spelling"]
               }
             ]
           },

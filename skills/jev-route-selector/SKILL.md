@@ -295,6 +295,31 @@ const selection = await selectJevRoute(
 - **No runtime changes**: Only affects route selection, not agent behavior
 - **Stage 1 only**: Automatic jev invocation (Stage 2) requires execution boundary
 
+## Known limitations
+
+### Coverage gaps
+The current catalog focuses on common cases. Some valid combinations lack dedicated routes:
+- **Moderate complexity**: No dedicated route; falls back to balanced-simple or deep-complex
+- **Cross-package simple**: Uses balanced-simple (multi-file), may be suboptimal for large monorepos
+- **Multi-file trivial**: Rare in practice; uses balanced-simple as fallback
+
+These are documented design choices, not bugs. Add custom routes to your catalog if needed.
+
+### Scope semantics
+Scope represents primarily **extent** (how many files/packages), not strictly **mutability** (read vs write):
+- `read-only`: Detected by keywords (find, list, search) + absence of change indicators
+- `single-file`: Default for most tasks without multi-file indicators
+- `multi-file`: Multiple files in same package
+- `cross-package`: Monorepo/workspace spanning packages
+
+A task can be read-only but cross-package (e.g., "Find all uses of X across packages").
+
+### Pattern matching
+Word-boundary aware matching prevents false positives but has limits:
+- Multi-word patterns ("breaking change", "rename variable") match as phrases
+- Negation detection handles direct patterns ("do not X", "avoid X") but not complex clauses
+- Filenames excluded (.ts, .js, .json, .md) but other extensions may trigger keywords
+
 ## Related
 
 - `/jev-run` - Execute jev evaluation for ambiguous cases
