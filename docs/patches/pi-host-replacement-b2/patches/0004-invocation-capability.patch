@@ -1,0 +1,890 @@
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -13,6 +13,7 @@
+  * Modes use this class and add their own I/O layer on top.
+  */
+ 
++import { randomUUID } from "node:crypto";
+ import { readFileSync } from "node:fs";
+ import { basename, dirname } from "node:path";
+ import type {
+@@ -28,6 +29,12 @@
+ 	BeforeToolCallResult,
+ 	PrepareNextTurnContext,
+ 	ThinkingLevel,
++} from "@earendil-works/pi-agent-core";
++import {
++	executePreparedToolCall,
++	finalizeToolInvocation,
++	prepareToolInvocation,
++	type ToolInvocationHooks,
+ } from "@earendil-works/pi-agent-core";
+ import { contentText, getCurrentSystemMessage, retryDelayMs } from "@earendil-works/pi-ai";
+ import type {
+@@ -83,6 +90,7 @@
+ 	type BoundaryContextPreview,
+ 	type ContextUsage,
+ 	type ExtensionCommandContextActions,
++	type ExtensionContext,
+ 	type ExtensionErrorListener,
+ 	type ExtensionMode,
+ 	ExtensionRunner,
+@@ -91,6 +99,7 @@
+ 	type MessageEndEvent,
+ 	type MessageStartEvent,
+ 	type MessageUpdateEvent,
++	type RegisteredTool,
+ 	type ReplacedSessionContext,
+ 	type SessionBeforeCompactResult,
+ 	type SessionBeforeTreeResult,
+@@ -99,7 +108,9 @@
+ 	type SessionStartEvent,
+ 	type ShutdownHandler,
+ 	type ToolDefinition,
++	type ToolExecutionContext,
+ 	type ToolExecutionEndEvent,
++	type ToolInvocationResult,
+ 	type ToolExecutionStartEvent,
+ 	type ToolExecutionUpdateEvent,
+ 	type ToolInfo,
+@@ -134,7 +145,7 @@
+ } from "./system-prompt.ts";
+ import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
+ import { createAllToolDefinitions } from "./tools/index.ts";
+-import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
++import { createToolDefinitionFromAgentTool, type ToolExecutionBinding } from "./tools/tool-definition-wrapper.ts";
+ import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+ 
+ // ============================================================================
+@@ -221,6 +232,50 @@
+ 		: undefined;
+ }
+ 
++/** Constructor-only, default-deny admission over actual host-resolved registrations. */
++export type ToolInvocationPolicy = (request: {
++	caller: RegisteredTool;
++	target: RegisteredTool;
++	sessionId: string;
++	cwd: string;
++	parentToolCallId: string;
++}) => boolean | Promise<boolean>;
++
++export type ToolInvocationUsageObservation =
++	| { state: "not-entered" | "pending" | "unknown" }
++	| { state: "known"; usage: Usage };
++
++/** Plain, defensive observation of this live session only, without executable identities. */
++export interface ToolInvocationRecord {
++	invocationId: string;
++	sessionId: string;
++	cwd: string;
++	parentToolCallId: string;
++	callerName: string;
++	targetName: string;
++	status: "pending" | "completed" | "denied" | "failed";
++	execution: "not-entered" | "entered";
++	isError?: boolean;
++	rawUsage: ToolInvocationUsageObservation;
++	finalUsage: ToolInvocationUsageObservation;
++}
++
++interface ToolExecutionFrame {
++	caller: RegisteredTool;
++	definition: ToolDefinition;
++	execute: ToolDefinition["execute"];
++	runner: ExtensionRunner;
++	sessionId: string;
++	cwd: string;
++	parentToolCallId: string;
++	signal: AbortSignal | undefined;
++	live: boolean;
++}
++
++function observeInvocationUsage(usage: Usage | undefined): ToolInvocationUsageObservation {
++	return usage ? { state: "known", usage: structuredClone(usage) } : { state: "unknown" };
++}
++
+ export interface AgentSessionConfig {
+ 	agent: Agent;
+ 	sessionManager: SessionManager;
+@@ -232,6 +287,8 @@
+ 	resourceLoader: ResourceLoader;
+ 	/** SDK custom tools registered outside extensions */
+ 	customTools?: ToolDefinition[];
++	/** Experimental bootstrap only; not forwarded through SDK factories or persisted settings. */
++	toolInvocationPolicy?: ToolInvocationPolicy;
+ 	/** Canonical model/auth runtime used by coding-agent internals. */
+ 	modelRuntime: ModelRuntime;
+ 	/** Keeps the prompt cache entry of the last session request warm. */
+@@ -309,6 +366,15 @@
+ 		total: number;
+ 	};
+ 	cost: number;
++	/** Nested accounting is live-session only; missing usage is not a zero bill. */
++	toolInvocations: {
++		scope: "live-session";
++		completeness: "complete" | "pending" | "unknown";
++		known: number;
++		unknown: number;
++		pending: number;
++		notEntered: number;
++	};
+ 	contextUsage?: ContextUsage;
+ }
+ 
+@@ -405,6 +471,15 @@
+ 
+ 	// Tool registry for extension getTools/setTools
+ 	private _toolRegistry: Map<string, AgentTool> = new Map();
++	private _registeredToolWrappers = new Map<string, { registration: RegisteredTool; tool: AgentTool }>();
++	private readonly _toolInvocationPolicy?: ToolInvocationPolicy;
++	private readonly _toolInvocationRecords: ToolInvocationRecord[] = [];
++	private readonly _toolInvocationExecutions = new Map<string, {
++		registration: RegisteredTool;
++		definition: ToolDefinition;
++		execute: ToolDefinition["execute"];
++		record: ToolInvocationRecord;
++	}>();
+ 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
+ 	private _toolPromptSnippets: Map<string, string> = new Map();
+ 	private _toolPromptGuidelines: Map<string, string[]> = new Map();
+@@ -420,6 +495,7 @@
+ 		this._scopedModels = config.scopedModels ?? [];
+ 		this._resourceLoader = config.resourceLoader;
+ 		this._customTools = config.customTools ?? [];
++		this._toolInvocationPolicy = config.toolInvocationPolicy;
+ 		this._cwd = config.cwd;
+ 		this._modelRuntime = config.modelRuntime;
+ 		this._cacheWarmer = config.cacheWarmer;
+@@ -604,6 +680,130 @@
+ 			isError: hookResult?.isError ?? isError,
+ 			usage: hookResult?.usage,
+ 		};
++	}
++
++	private _bindToolExecution(
++		caller: RegisteredTool,
++		runner: ExtensionRunner,
++		parentToolCallId: string,
++		signal: AbortSignal | undefined,
++		context: ExtensionContext,
++	): ToolExecutionBinding {
++		const frame: ToolExecutionFrame = {
++			caller, definition: caller.definition, execute: caller.definition.execute,
++			runner, parentToolCallId, signal, sessionId: this.sessionId, cwd: this._cwd, live: true,
++		};
++		// Preserve the runner's lazy/stale-context getters; signal belongs to this execution.
++		const executionContext = Object.defineProperties({}, {
++			...Object.getOwnPropertyDescriptors(context),
++			signal: { get: () => signal },
++			invokeTool: { value: (name: string, args: Record<string, unknown>) => this._invokeTool(frame, name, args) },
++		}) as ToolExecutionContext;
++		const pending = this._toolInvocationExecutions.get(parentToolCallId);
++		const record = pending?.registration === caller && pending.definition === frame.definition &&
++			pending.execute === frame.execute ? pending.record : undefined;
++		return {
++			context: executionContext,
++			run: async (execute) => {
++				if (record) {
++					record.execution = "entered";
++					record.rawUsage = { state: "pending" };
++				}
++				try {
++					const result = await execute();
++					// Observe the actual definition promise BEFORE executor update settlement.
++					if (record) record.rawUsage = observeInvocationUsage(result.usage);
++					return result;
++				} finally {
++					frame.live = false;
++					if (record?.rawUsage.state === "pending") record.rawUsage = { state: "unknown" };
++				}
++			},
++		};
++	}
++
++	private async _invokeTool(
++		frame: ToolExecutionFrame,
++		name: string,
++		args: Record<string, unknown>,
++	): Promise<ToolInvocationResult> {
++		const invocationId = randomUUID();
++		const denied = (reason: string): ToolInvocationResult => ({
++			content: [{ type: "text", text: reason }], details: undefined, isError: true, invocationId,
++		});
++		// Retain every admitted record. Capacity is checked before policy, hooks or target effects.
++		if (this._toolInvocationRecords.length >= 128) return denied("Tool invocation ledger is full");
++		const record: ToolInvocationRecord = {
++			invocationId, sessionId: frame.sessionId, cwd: frame.cwd, parentToolCallId: frame.parentToolCallId,
++			callerName: frame.definition.name, targetName: name, status: "denied", execution: "not-entered",
++			isError: true, rawUsage: { state: "not-entered" }, finalUsage: { state: "not-entered" },
++		};
++		this._toolInvocationRecords.push(record);
++		if (!frame.live) return denied("Parent tool execution has completed");
++		const caller = this._registeredToolWrappers.get(frame.definition.name);
++		const target = this._registeredToolWrappers.get(name);
++		const active = this.agent.state.tools;
++		if (!caller || caller.registration !== frame.caller || !active.includes(caller.tool) ||
++			!target || !active.includes(target.tool)) return denied("Tool invocation requires active registered tools");
++		const definition = target.registration.definition;
++		const execute = definition.execute;
++		let admitted = false;
++		try {
++			admitted = await this._toolInvocationPolicy?.({
++				caller: frame.caller, target: target.registration, sessionId: frame.sessionId,
++				cwd: frame.cwd, parentToolCallId: frame.parentToolCallId,
++			}) === true;
++		} catch {
++			// A policy failure is a denial, not permission to fall through.
++		}
++		if (!admitted) return denied("Tool invocation denied by host policy");
++
++		record.status = "pending";
++		record.isError = undefined;
++		record.finalUsage = { state: "pending" };
++		// The public preparation phase owns argument preparation and schema validation.
++		const toolCall: AgentToolCall = {
++			type: "toolCall", id: invocationId, name, arguments: args as AgentToolCall["arguments"],
++		};
++		// Name lookup sees only the admitted executable, never another registration with the same name.
++		const context: AgentContext = { messages: [], tools: [target.tool] };
++		const hooks: ToolInvocationHooks = {
++			beforeToolCall: ({ toolCall, args }) => this._beforeToolCall(frame.runner, toolCall, args),
++			afterToolCall: ({ toolCall, args, result, isError }) =>
++				this._afterToolCall(frame.runner, toolCall, args, result, isError),
++		};
++		this._toolInvocationExecutions.set(invocationId, { registration: target.registration, definition, execute, record });
++		try {
++			const prepared = await prepareToolInvocation(context, toolCall, hooks, frame.signal);
++			const outcome = prepared.kind === "immediate" ? prepared : await finalizeToolInvocation(
++				context, prepared,
++				await executePreparedToolCall(prepared, frame.signal, async (event) => {
++					if (event.type === "tool_execution_update") await frame.runner.emit(event);
++				}),
++				hooks, frame.signal,
++			);
++			record.status = "completed";
++			record.isError = outcome.isError;
++			record.finalUsage = record.execution === "not-entered"
++				? { state: "not-entered" } : observeInvocationUsage(outcome.result.usage);
++			// Never forward usage: an ordinary parent may return this result to the main loop.
++			return {
++				content: outcome.result.content, details: outcome.result.details,
++				isError: outcome.isError, invocationId,
++			};
++		} catch (error) {
++			record.status = "failed";
++			record.isError = true;
++			record.finalUsage = record.execution === "not-entered" ? { state: "not-entered" } : { state: "unknown" };
++			return denied(error instanceof Error ? error.message : String(error));
++		} finally {
++			this._toolInvocationExecutions.delete(invocationId);
++		}
++	}
++
++	/** Live-session observations only; no persistence, branch filtering or restart reconstruction. */
++	getToolInvocationRecords(): ToolInvocationRecord[] {
++		return structuredClone(this._toolInvocationRecords);
+ 	}
+ 
+ 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+@@ -3214,22 +3414,22 @@
+ 				.filter((entry): entry is readonly [string, string[]] => entry !== undefined),
+ 		);
+ 		const runner = this._extensionRunner;
+-		const wrappedExtensionTools = wrapRegisteredTools(allCustomTools, runner);
+-		const wrappedBuiltInTools = wrapRegisteredTools(
+-			Array.from(this._baseToolDefinitions.values())
+-				.filter((definition) => isAllowedTool(definition.name))
+-				.map((definition) => ({
+-					definition,
+-					sourceInfo: createSyntheticSourceInfo(`<builtin:${definition.name}>`, { source: "builtin" }),
+-				})),
+-			runner,
+-		);
+-
+-		const toolRegistry = new Map(wrappedBuiltInTools.map((tool) => [tool.name, tool]));
+-		for (const tool of wrappedExtensionTools as AgentTool[]) {
+-			toolRegistry.set(tool.name, tool);
+-		}
+-		this._toolRegistry = toolRegistry;
++		const bindExecution = this._bindToolExecution.bind(this);
++		const wrappedExtensionTools = wrapRegisteredTools(allCustomTools, runner, bindExecution);
++		const builtInRegistrations = Array.from(this._baseToolDefinitions.values())
++			.filter((definition) => isAllowedTool(definition.name))
++			.map((definition) => ({
++				definition,
++				sourceInfo: createSyntheticSourceInfo(`<builtin:${definition.name}>`, { source: "builtin" }),
++			}));
++		const wrappedBuiltInTools = wrapRegisteredTools(builtInRegistrations, runner, bindExecution);
++		const registrations = [...builtInRegistrations, ...allCustomTools];
++		const wrappers = [...wrappedBuiltInTools, ...wrappedExtensionTools];
++		// Same ordering and winning override for execution and policy identity resolution.
++		this._registeredToolWrappers = new Map(registrations.map((registration, index) => [
++			registration.definition.name, { registration, tool: wrappers[index] },
++		]));
++		this._toolRegistry = new Map(wrappers.map((tool) => [tool.name, tool]));
+ 
+ 		const nextActiveToolNames = (
+ 			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]
+@@ -3821,7 +4021,10 @@
+ 	/**
+ 	 * Get session statistics. Aggregates over ALL session entries (including
+ 	 * history that was compacted away), so token/cost totals reflect what was
+-	 * actually billed across the session.
++	 * actually billed across the session where usage is known. Also adds one known
++	 * contribution per live host invocation (final usage replaces raw usage).
++	 * Unlike this method, getUsageCostBreakdown remains entry-only and excludes
++	 * this nonpersistent ledger. Exceptional/late accounting is not yet hardened.
+ 	 */
+ 	getSessionStats(): SessionStats {
+ 		let userMessages = 0;
+@@ -3857,9 +4060,31 @@
+ 			}
+ 		}
+ 
++		const toolInvocations: SessionStats["toolInvocations"] = {
++			scope: "live-session", completeness: "complete", known: 0, unknown: 0, pending: 0, notEntered: 0,
++		};
++		for (const record of this._toolInvocationRecords) {
++			if (record.status === "pending") toolInvocations.pending++;
++			if (record.execution === "not-entered") {
++				toolInvocations.notEntered++;
++				continue;
++			}
++			const contribution = record.finalUsage.state === "known" ? record.finalUsage : record.rawUsage;
++			if (contribution.state === "known") {
++				addUsageToTotals(usageTotals, contribution.usage);
++				toolInvocations.known++;
++			}
++			if (record.finalUsage.state === "unknown" || contribution.state === "unknown") {
++				toolInvocations.unknown++;
++			}
++		}
++		toolInvocations.completeness = toolInvocations.pending > 0 ? "pending"
++			: toolInvocations.unknown > 0 ? "unknown" : "complete";
++
+ 		return {
+ 			sessionFile: this.sessionFile,
+ 			sessionId: this.sessionId,
++			toolInvocations,
+ 			userMessages,
+ 			assistantMessages,
+ 			toolCalls,
+diff --git a/packages/coding-agent/src/core/extensions/index.ts b/packages/coding-agent/src/core/extensions/index.ts
+--- a/packages/coding-agent/src/core/extensions/index.ts
++++ b/packages/coding-agent/src/core/extensions/index.ts
+@@ -170,6 +170,8 @@
+ 	ToolCallEventResult,
+ 	// Tools
+ 	ToolDefinition,
++	ToolExecutionContext,
++	ToolInvocationResult,
+ 	// Events - Tool Execution
+ 	ToolExecutionEndEvent,
+ 	// Tool execution mode
+diff --git a/packages/coding-agent/src/core/extensions/types.ts b/packages/coding-agent/src/core/extensions/types.ts
+--- a/packages/coding-agent/src/core/extensions/types.ts
++++ b/packages/coding-agent/src/core/extensions/types.ts
+@@ -352,6 +352,23 @@
+ 	getSystemPrompt(): string;
+ }
+ 
++/** Usage-free projection: the owning session accounts for nested consumption. */
++export interface ToolInvocationResult {
++	content: (TextContent | ImageContent)[];
++	details: unknown;
++	isError: boolean;
++	invocationId: string;
++}
++
++/**
++ * Context minted for an actual registered tool execution, not commands or event handlers.
++ * Host invocation is denied unless the session's constructor policy admits it.
++ * Experimental bootstrap only: origin and lifecycle hardening are not complete.
++ */
++export interface ToolExecutionContext extends ExtensionContext {
++	invokeTool(name: string, args: Record<string, unknown>): Promise<ToolInvocationResult>;
++}
++
+ /**
+  * Extended context for command handlers.
+  * Includes session control methods only safe in user-initiated commands.
+@@ -488,7 +505,7 @@
+ 		params: Static<TParams>,
+ 		signal: AbortSignal | undefined,
+ 		onUpdate: AgentToolUpdateCallback<TDetails> | undefined,
+-		ctx: ExtensionContext,
++		ctx: ToolExecutionContext,
+ 	): Promise<AgentToolResult<TDetails>>;
+ 
+ 	/** Custom rendering for tool call display */
+diff --git a/packages/coding-agent/src/core/extensions/wrapper.ts b/packages/coding-agent/src/core/extensions/wrapper.ts
+--- a/packages/coding-agent/src/core/extensions/wrapper.ts
++++ b/packages/coding-agent/src/core/extensions/wrapper.ts
+@@ -1,27 +1,43 @@
+ /**
+- * Tool wrappers for extension-registered tools.
+- *
+- * These wrappers only adapt tool execution so extension tools receive the runner context.
+- * Tool call and tool result interception is handled by AgentSession via agent-core hooks.
++ * Execution adapters for registered tools. AgentSession owns interception;
++ * a standalone wrapper has no host-invocation authority.
+  */
++import type { AgentTool } from "@earendil-works/pi-agent-core";
++import {
++	type ToolExecutionBinding,
++	withoutToolInvocation,
++	wrapToolDefinition,
++} from "../tools/tool-definition-wrapper.ts";
++import type { ExtensionRunner } from "./runner.ts";
++import type { ExtensionContext, RegisteredTool } from "./types.ts";
+ 
+-import type { AgentTool } from "@earendil-works/pi-agent-core";
+-import { wrapToolDefinition } from "../tools/tool-definition-wrapper.ts";
+-import type { ExtensionRunner } from "./runner.ts";
+-import type { RegisteredTool } from "./types.ts";
++/** Internal owner seam, called only when the registered wrapper actually executes. */
++export type RegisteredToolExecutionBinder = (
++	registeredTool: RegisteredTool,
++	runner: ExtensionRunner,
++	toolCallId: string,
++	signal: AbortSignal | undefined,
++	context: ExtensionContext,
++) => ToolExecutionBinding;
+ 
+-/**
+- * Wrap a RegisteredTool into an AgentTool.
+- * Uses the runner's createContext() for consistent context across tools and event handlers.
+- */
+-export function wrapRegisteredTool(registeredTool: RegisteredTool, runner: ExtensionRunner): AgentTool {
+-	return wrapToolDefinition(registeredTool.definition, () => runner.createContext());
++export function wrapRegisteredTool(
++	registeredTool: RegisteredTool,
++	runner: ExtensionRunner,
++	bindExecution?: RegisteredToolExecutionBinder,
++): AgentTool {
++	return wrapToolDefinition(registeredTool.definition, undefined, (toolCallId, signal) => {
++		const context = runner.createContext();
++		return bindExecution?.(registeredTool, runner, toolCallId, signal, context) ?? {
++			context: withoutToolInvocation(context),
++			run: (execute) => execute(),
++		};
++	});
+ }
+ 
+-/**
+- * Wrap all registered tools into AgentTools.
+- * Uses the runner's createContext() for consistent context across tools and event handlers.
+- */
+-export function wrapRegisteredTools(registeredTools: RegisteredTool[], runner: ExtensionRunner): AgentTool[] {
+-	return registeredTools.map((tool) => wrapRegisteredTool(tool, runner));
++export function wrapRegisteredTools(
++	registeredTools: RegisteredTool[],
++	runner: ExtensionRunner,
++	bindExecution?: RegisteredToolExecutionBinder,
++): AgentTool[] {
++	return registeredTools.map((tool) => wrapRegisteredTool(tool, runner, bindExecution));
+ }
+diff --git a/packages/coding-agent/src/core/tools/tool-definition-wrapper.ts b/packages/coding-agent/src/core/tools/tool-definition-wrapper.ts
+--- a/packages/coding-agent/src/core/tools/tool-definition-wrapper.ts
++++ b/packages/coding-agent/src/core/tools/tool-definition-wrapper.ts
+@@ -1,10 +1,35 @@
+-import type { AgentTool } from "@earendil-works/pi-agent-core";
+-import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
++import { randomUUID } from "node:crypto";
++import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
++import type { ExtensionContext, ToolDefinition, ToolExecutionContext } from "../extensions/types.ts";
++
++/** Internal execution adapter seam; only an owning host can supply a binding. */
++export interface ToolExecutionBinding {
++	context: ToolExecutionContext;
++	run<T extends AgentToolResult<unknown>>(execute: () => Promise<T>): Promise<T>;
++}
++
++export type ToolExecutionBinder = (toolCallId: string, signal: AbortSignal | undefined) => ToolExecutionBinding;
++
++/** Add denial, not authority, without evaluating the original context's getters. */
++export function withoutToolInvocation(context: ExtensionContext): ToolExecutionContext {
++	return Object.defineProperties({}, {
++		...Object.getOwnPropertyDescriptors(context),
++		invokeTool: {
++			value: async () => ({
++				content: [{ type: "text", text: "Tool invocation requires an owning session execution" }],
++				details: undefined,
++				isError: true,
++				invocationId: randomUUID(),
++			}),
++		},
++	}) as ToolExecutionContext;
++}
+ 
+ /** Wrap a ToolDefinition into an AgentTool for the core runtime. */
+ export function wrapToolDefinition<TDetails = unknown>(
+ 	definition: ToolDefinition<any, TDetails>,
+ 	ctxFactory?: () => ExtensionContext,
++	bindExecution?: ToolExecutionBinder,
+ ): AgentTool<any, TDetails> {
+ 	return {
+ 		name: definition.name,
+@@ -14,8 +39,17 @@
+ 		constrainedSampling: definition.constrainedSampling,
+ 		prepareArguments: definition.prepareArguments,
+ 		executionMode: definition.executionMode,
+-		execute: (toolCallId, params, signal, onUpdate, ctx?: ExtensionContext) =>
+-			definition.execute(toolCallId, params, signal, onUpdate, ctx ?? (ctxFactory?.() as ExtensionContext)),
++		execute: (toolCallId, params, signal, onUpdate, ctx?: ExtensionContext) => {
++			if (bindExecution) {
++				const binding = bindExecution(toolCallId, signal);
++				return binding.run(() => definition.execute(toolCallId, params, signal, onUpdate, binding.context));
++			}
++			const context = ctx ?? ctxFactory?.();
++			// Standalone built-ins historically receive undefined when no context is supplied.
++			// Preserve that behavior; do not fabricate an ExtensionContext for them.
++			const executionContext = context ? withoutToolInvocation(context) : undefined;
++			return definition.execute(toolCallId, params, signal, onUpdate, executionContext as ToolExecutionContext);
++		},
+ 	};
+ }
+ 
+diff --git a/packages/coding-agent/src/index.ts b/packages/coding-agent/src/index.ts
+--- a/packages/coding-agent/src/index.ts
++++ b/packages/coding-agent/src/index.ts
+@@ -22,6 +22,9 @@
+ 	type PromptOptions,
+ 	parseSkillBlock,
+ 	type SessionStats,
++	type ToolInvocationPolicy,
++	type ToolInvocationRecord,
++	type ToolInvocationUsageObservation,
+ } from "./core/agent-session.ts";
+ export { readStoredCredential } from "./core/auth-storage.ts";
+ export type { CacheWarmingDecision, CacheWarmingStatus } from "./core/cache-warmer.ts";
+@@ -164,6 +167,8 @@
+ 	ToolCallEvent,
+ 	ToolCallEventResult,
+ 	ToolDefinition,
++	ToolExecutionContext,
++	ToolInvocationResult,
+ 	ToolExecutionEndEvent,
+ 	ToolExecutionMode,
+ 	ToolExecutionStartEvent,
+diff --git a/packages/coding-agent/test/suite/agent-session-tool-invocation.test.ts b/packages/coding-agent/test/suite/agent-session-tool-invocation.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/coding-agent/test/suite/agent-session-tool-invocation.test.ts
+@@ -0,0 +1,286 @@
++import { fauxAssistantMessage, fauxToolCall, type Usage } from "@earendil-works/pi-ai/compat";
++import { Type } from "typebox";
++import { describe, expect, it } from "vitest";
++import {
++	AgentSession,
++	defineTool,
++	type ExtensionAPI,
++	type ToolExecutionContext,
++	type ToolInvocationPolicy,
++	type ToolInvocationResult,
++	wrapRegisteredTool,
++} from "../../src/index.ts";
++import { createHarness, type Harness } from "./harness.ts";
++
++const rawUsage: Usage = {
++	input: 3, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 5,
++	cost: { input: 0.25, output: 0.25, cacheRead: 0, cacheWrite: 0, total: 0.5 },
++};
++const finalUsage: Usage = {
++	input: 7, output: 11, cacheRead: 1, cacheWrite: 2, totalTokens: 21,
++	cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0.5, total: 4 },
++};
++
++type PolicyMode = "admit" | "absent" | "false" | "throws";
++
++function deferred() {
++	let resolve!: () => void;
++	const promise = new Promise<void>((fulfill) => { resolve = fulfill; });
++	return { promise, resolve };
++}
++
++async function createFixture(options: {
++	policy?: PolicyMode;
++	unknownUsage?: boolean;
++	retainOnly?: boolean;
++	hooks?: (pi: ExtensionAPI) => void;
++} = {}) {
++	const visits: string[] = [];
++	const effects: string[] = [];
++	const nested: ToolInvocationResult[] = [];
++	const policies: Parameters<ToolInvocationPolicy>[0][] = [];
++	const contexts: ToolExecutionContext[] = [];
++	let parentSignal: AbortSignal | undefined;
++	const target = defineTool({
++		name: "mcpScript", label: "Synthetic script", description: "Text-only synthetic target",
++		parameters: Type.Object({ value: Type.String() }),
++		prepareArguments: () => {
++			visits.push("prepare");
++			return { value: "prepared" };
++		},
++		async execute(_id, args, signal, onUpdate, ctx) {
++			expect(signal).toBe(parentSignal);
++			expect(ctx.signal).toBe(signal);
++			effects.push(args.value);
++			visits.push(`execute:${args.value}`);
++			onUpdate?.({ content: [{ type: "text", text: "progress" }], details: undefined });
++			return {
++				content: [{ type: "text", text: args.value }], details: { raw: true },
++				usage: options.unknownUsage ? undefined : rawUsage,
++			};
++		},
++	});
++	const parent = defineTool({
++		name: "parent", label: "Parent", description: "Synthetic registered parent",
++		parameters: Type.Object({}),
++		async execute(_id, _args, signal, _onUpdate, ctx) {
++			parentSignal = signal;
++			contexts.push(ctx);
++			if (options.retainOnly) return { content: [{ type: "text", text: "retained" }], details: undefined };
++			const result = await ctx.invokeTool("mcpScript", { value: "raw" });
++			nested.push(result);
++			return result;
++		},
++	});
++	const parentExecute = parent.execute;
++	const targetExecute = target.execute;
++	const policy: ToolInvocationPolicy = (request) => {
++		policies.push(request);
++		if (options.policy === "throws") throw new Error("synthetic policy failure");
++		return options.policy !== "false" && request.caller.definition === parent &&
++			request.caller.definition.execute === parentExecute && request.target.definition === target &&
++			request.target.definition.execute === targetExecute;
++	};
++	const harness = await createHarness({
++		tools: [], toolInvocationPolicy: options.policy === "absent" ? undefined : policy,
++		settings: { retry: { enabled: false }, compaction: { enabled: false } },
++		extensionFactories: [(pi) => {
++			pi.registerTool(parent);
++			pi.registerTool(target);
++			options.hooks?.(pi);
++		}],
++	});
++	await harness.session.bindExtensions({});
++	return { harness, visits, effects, nested, policies, contexts, parent, target };
++}
++
++async function runParent(harness: Harness, id = "root-call") {
++	harness.setResponses([
++		fauxAssistantMessage(fauxToolCall("parent", {}, { id }), { stopReason: "toolUse" }),
++		fauxAssistantMessage("finished"),
++	]);
++	await harness.session.prompt("Exercise the registered parent", { expandPromptTemplates: false });
++	await harness.session.waitForIdle();
++}
++
++function modelTotals(harness: Harness) {
++	const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
++	for (const message of harness.session.messages) {
++		if (message.role !== "assistant") continue;
++		totals.input += message.usage.input;
++		totals.output += message.usage.output;
++		totals.cacheRead += message.usage.cacheRead;
++		totals.cacheWrite += message.usage.cacheWrite;
++		totals.cost += message.usage.cost.total;
++	}
++	return totals;
++}
++
++// Bootstrap exception: no meaningful missing-method RED. These are real host executions,
++// not claims about the deferred origin/single-use/lifecycle/exceptional-accounting guards.
++describe("AgentSession host tool invocation bootstrap", () => {
++	it("should dispatch through real hooks and count finalized usage once without another model turn", async () => {
++		const updateEntered = deferred();
++		const releaseUpdate = deferred();
++		const hookVisits: string[] = [];
++		const fixture = await createFixture({ hooks: (pi) => {
++			pi.on("tool_call", (event) => {
++				if (event.toolName !== "mcpScript") return;
++				hookVisits.push("call");
++				expect(event.input).toEqual({ value: "prepared" });
++				event.input.value = "mutated";
++			});
++			pi.on("tool_execution_update", async (event) => {
++				if (event.toolName !== "mcpScript") return;
++				updateEntered.resolve();
++				await releaseUpdate.promise;
++			});
++			pi.on("tool_result", (event) => {
++				if (event.toolName !== "mcpScript") return;
++				hookVisits.push("result");
++				expect(event.input).toEqual({ value: "mutated" });
++				expect(event.content).toEqual([{ type: "text", text: "mutated" }]);
++				expect(event.usage).toEqual(rawUsage);
++				return { content: [{ type: "text", text: "intercepted" }], details: { final: true }, usage: finalUsage };
++			});
++		} });
++		const { harness, effects, nested, visits, policies, contexts } = fixture;
++		const prompt = runParent(harness);
++		try {
++			expect(harness.session).toBeInstanceOf(AgentSession);
++			await Promise.race([
++				updateEntered.promise,
++				prompt.then(() => { throw new Error("Parent finished without entering the nested update"); }),
++			]);
++			// The target promise settles while its accepted update handler is still pending.
++			await new Promise<void>((resolve) => setImmediate(resolve));
++			expect(harness.session.getToolInvocationRecords()[0]).toMatchObject({
++				status: "pending", execution: "entered", rawUsage: { state: "known", usage: rawUsage },
++				finalUsage: { state: "pending" },
++			});
++			expect(harness.session.getSessionStats().toolInvocations.completeness).toBe("pending");
++			releaseUpdate.resolve();
++			await prompt;
++
++			expect(visits).toEqual(["prepare", "execute:mutated"]);
++			expect(hookVisits).toEqual(["call", "result"]);
++			expect(effects).toEqual(["mutated"]);
++			expect(nested).toHaveLength(1);
++			expect(Object.keys(nested[0]).sort()).toEqual(["content", "details", "invocationId", "isError"]);
++			expect(nested[0]).toMatchObject({ content: [{ type: "text", text: "intercepted" }], details: { final: true }, isError: false });
++			expect(nested[0].invocationId).not.toBe("root-call");
++			expect(policies).toHaveLength(1);
++			expect(policies[0]).toMatchObject({ sessionId: harness.session.sessionId, cwd: harness.tempDir, parentToolCallId: "root-call" });
++			expect(policies[0].caller).toBe(harness.session.extensionRunner.getAllRegisteredTools().find((tool) => tool.definition === fixture.parent));
++			expect(policies[0].target).toBe(harness.session.extensionRunner.getAllRegisteredTools().find((tool) => tool.definition === fixture.target));
++			expect(typeof Object.getOwnPropertyDescriptor(contexts[0], "model")?.get).toBe("function");
++			expect("invokeTool" in harness.session.extensionRunner.createContext()).toBe(false);
++			expect("invokeTool" in harness.session.extensionRunner.createCommandContext()).toBe(false);
++
++			const records = harness.session.getToolInvocationRecords();
++			expect(records).toEqual([{
++				invocationId: nested[0].invocationId, sessionId: harness.session.sessionId, cwd: harness.tempDir,
++				parentToolCallId: "root-call", callerName: "parent", targetName: "mcpScript", status: "completed",
++				execution: "entered", isError: false, rawUsage: { state: "known", usage: rawUsage },
++				finalUsage: { state: "known", usage: finalUsage },
++			}]);
++			records[0].callerName = "tampered";
++			if (records[0].finalUsage.state === "known") records[0].finalUsage.usage.cost.total = 999;
++			expect(harness.session.getToolInvocationRecords()[0].callerName).toBe("parent");
++			expect(harness.session.getToolInvocationRecords()[0].finalUsage).toEqual({ state: "known", usage: finalUsage });
++			const model = modelTotals(harness);
++			const stats = harness.session.getSessionStats();
++			expect(stats.tokens).toEqual({ input: model.input + 7, output: model.output + 11,
++				cacheRead: model.cacheRead + 1, cacheWrite: model.cacheWrite + 2,
++				total: model.input + model.output + model.cacheRead + model.cacheWrite + 21 });
++			expect(stats.cost).toBe(model.cost + 4);
++			expect(stats.toolInvocations).toEqual({ scope: "live-session", completeness: "complete", known: 1, unknown: 0, pending: 0, notEntered: 0 });
++			expect(harness.session.messages.filter((message) => message.role !== "system").map((message) => message.role))
++				.toEqual(["user", "assistant", "toolResult", "assistant"]);
++			const toolResults = harness.session.messages.filter((message) => message.role === "toolResult");
++			expect(toolResults).toHaveLength(1);
++			expect(toolResults[0].toolName).toBe("parent");
++			expect(toolResults[0].usage).toBeUndefined();
++			expect(stats.assistantMessages).toBe(2);
++			expect(harness.eventsOfType("tool_execution_end")).toHaveLength(1);
++			expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
++			expect(harness.getPendingResponseCount()).toBe(0);
++		} finally {
++			releaseUpdate.resolve();
++			await prompt;
++			await harness.session.waitForIdle();
++			harness.cleanup();
++		}
++	});
++
++	it.each(["absent", "false", "throws"] as const)("should deny a %s policy before target effects", async (policy) => {
++		const { harness, visits, effects, nested } = await createFixture({ policy });
++		try {
++			await runParent(harness);
++			expect(visits).toEqual([]);
++			expect(effects).toEqual([]);
++			expect(nested).toHaveLength(1);
++			expect(nested[0].isError).toBe(true);
++			expect(Object.keys(nested[0]).sort()).toEqual(["content", "details", "invocationId", "isError"]);
++			expect(harness.session.getToolInvocationRecords()[0]).toMatchObject({
++				status: "denied", execution: "not-entered", rawUsage: { state: "not-entered" }, finalUsage: { state: "not-entered" },
++			});
++			expect(harness.session.getSessionStats().toolInvocations).toEqual({ scope: "live-session", completeness: "complete", known: 0, unknown: 0, pending: 0, notEntered: 1 });
++		} finally { await harness.session.waitForIdle(); harness.cleanup(); }
++	});
++
++	it("should deny a retained invocation after its parent completes", async () => {
++		const { harness, contexts, effects, policies } = await createFixture({ retainOnly: true });
++		try {
++			await runParent(harness);
++			const result = await contexts[0].invokeTool("mcpScript", { value: "late" });
++			expect(result.isError).toBe(true);
++			expect(result.content).toEqual([{ type: "text", text: "Parent tool execution has completed" }]);
++			expect("usage" in result).toBe(false);
++			expect(effects).toEqual([]);
++			expect(policies).toEqual([]);
++		} finally { await harness.session.waitForIdle(); harness.cleanup(); }
++	});
++
++	it("should expose missing usage as unknown rather than zero consumption", async () => {
++		const { harness, effects } = await createFixture({ unknownUsage: true });
++		try {
++			await runParent(harness);
++			expect(effects).toEqual(["prepared"]);
++			expect(harness.session.getToolInvocationRecords()[0]).toMatchObject({
++				execution: "entered", rawUsage: { state: "unknown" }, finalUsage: { state: "unknown" },
++			});
++			expect(harness.session.getSessionStats().toolInvocations).toEqual({ scope: "live-session", completeness: "unknown", known: 0, unknown: 1, pending: 0, notEntered: 0 });
++		} finally { await harness.session.waitForIdle(); harness.cleanup(); }
++	});
++
++	it("should refuse capacity overflow without evicting prior records", async () => {
++		const { harness, nested, effects, policies } = await createFixture();
++		try {
++			// Separate root executions; multiple invocations per parent are not a supported contract.
++			for (let index = 0; index < 128; index++) await runParent(harness, `root-${index}`);
++			const before = harness.session.getToolInvocationRecords();
++			await runParent(harness, "overflow-root");
++			expect(before).toHaveLength(128);
++			expect(harness.session.getToolInvocationRecords()).toEqual(before);
++			expect(nested[128].isError).toBe(true);
++			expect(nested[128].content).toEqual([{ type: "text", text: "Tool invocation ledger is full" }]);
++			expect(effects).toHaveLength(128);
++			expect(policies).toHaveLength(128);
++		} finally { await harness.session.waitForIdle(); harness.cleanup(); }
++	});
++
++	it("should give standalone registered wrappers denial rather than host authority", async () => {
++		const { harness, effects, nested, parent } = await createFixture();
++		try {
++			const registration = harness.session.extensionRunner.getAllRegisteredTools().find((tool) => tool.definition === parent);
++			if (!registration) throw new Error("Missing registered parent");
++			await wrapRegisteredTool(registration, harness.session.extensionRunner).execute("standalone", {}, undefined);
++			expect(nested).toHaveLength(1);
++			expect(nested[0].isError).toBe(true);
++			expect("usage" in nested[0]).toBe(false);
++			expect(effects).toEqual([]);
++			expect(harness.session.getToolInvocationRecords()).toEqual([]);
++		} finally { await harness.session.waitForIdle(); harness.cleanup(); }
++	});
++});
+diff --git a/packages/coding-agent/test/suite/harness.ts b/packages/coding-agent/test/suite/harness.ts
+--- a/packages/coding-agent/test/suite/harness.ts
++++ b/packages/coding-agent/test/suite/harness.ts
+@@ -15,7 +15,7 @@
+ 	Model,
+ } from "@earendil-works/pi-ai/compat";
+ import { registerFauxProvider, streamSimple } from "@earendil-works/pi-ai/compat";
+-import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-session.ts";
++import { AgentSession, type AgentSessionConfig, type AgentSessionEvent } from "../../src/core/agent-session.ts";
+ import { AuthStorage } from "../../src/core/auth-storage.ts";
+ import type { ExtensionRunner } from "../../src/core/extensions/index.ts";
+ import { convertToLlm } from "../../src/core/messages.ts";
+@@ -64,6 +64,7 @@
+ 	models?: FauxModelDefinition[];
+ 	settings?: Partial<Settings>;
+ 	tools?: AgentTool[];
++	toolInvocationPolicy?: AgentSessionConfig["toolInvocationPolicy"];
+ 	initialActiveToolNames?: string[];
+ 	allowedToolNames?: string[];
+ 	excludedToolNames?: string[];
+@@ -187,6 +188,7 @@
+ 		modelRuntime: getModelRuntime(modelRegistry),
+ 		resourceLoader,
+ 		baseToolsOverride: toolMap,
++		toolInvocationPolicy: options.toolInvocationPolicy,
+ 		initialActiveToolNames: options.initialActiveToolNames,
+ 		allowedToolNames: options.allowedToolNames,
+ 		excludedToolNames: options.excludedToolNames,
