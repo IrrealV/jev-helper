@@ -1,0 +1,839 @@
+{
+  "schema_version": 1,
+  "package": "pi-host-replacement-b2",
+  "status": "experimental-source-only",
+  "upstream": {
+    "project": "pi",
+    "version": "v0.87.1",
+    "git_commit": null,
+    "archive": {
+      "filename": "v0.87.1.tar.gz",
+      "root": "pi-0.87.1",
+      "bytes": 8058231,
+      "sha256": "c3902f45689af9ed9c8ee225554d31a649a993b06f04ab2022bb91ed75e808dc"
+    }
+  },
+  "license": {
+    "path": "LICENSE.pi",
+    "upstream_path": "LICENSE",
+    "spdx": "MIT",
+    "bytes": 1069,
+    "sha256": "0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48"
+  },
+  "payload_allowlist": [
+    "packages/agent/src/agent-loop.ts",
+    "packages/agent/src/index.ts",
+    "packages/agent/src/tool-execution.ts",
+    "packages/agent/test/tool-execution.test.ts",
+    "packages/coding-agent/src/core/agent-session-runtime.ts",
+    "packages/coding-agent/src/core/agent-session.ts",
+    "packages/coding-agent/src/core/event-bus.ts",
+    "packages/coding-agent/src/core/extensions/index.ts",
+    "packages/coding-agent/src/core/extensions/runner.ts",
+    "packages/coding-agent/src/core/extensions/types.ts",
+    "packages/coding-agent/src/core/extensions/wrapper.ts",
+    "packages/coding-agent/src/core/tool-invocation-scope.ts",
+    "packages/coding-agent/src/core/tools/tool-definition-wrapper.ts",
+    "packages/coding-agent/src/index.ts",
+    "packages/coding-agent/test/suite/agent-session-tool-invocation-guards.test.ts",
+    "packages/coding-agent/test/suite/agent-session-tool-invocation-lifecycle.test.ts",
+    "packages/coding-agent/test/suite/agent-session-tool-invocation-origin.test.ts",
+    "packages/coding-agent/test/suite/agent-session-tool-invocation-replacement.test.ts",
+    "packages/coding-agent/test/suite/agent-session-tool-invocation.test.ts",
+    "packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts",
+    "packages/coding-agent/test/suite/harness.ts",
+    "packages/coding-agent/test/suite/host-invocation-lifecycle-fixture.ts",
+    "packages/coding-agent/test/suite/host-invocation-replacement-fixture.ts"
+  ],
+  "base_files": [
+    {
+      "path": "packages/agent/src/agent-loop.ts",
+      "state": {
+        "bytes": 26649,
+        "sha256": "c3d99a5b0f24d1e7fde41cbeb2cd7a2f3559aa3e9c1df975abef21d7e0ecd189"
+      }
+    },
+    {
+      "path": "packages/agent/src/index.ts",
+      "state": {
+        "bytes": 4045,
+        "sha256": "f335c42e75a0ab39eab9d8a08a01cd8804b720ed89f1f0a25ea12239210132d3"
+      }
+    },
+    {
+      "path": "packages/agent/src/tool-execution.ts",
+      "state": null
+    },
+    {
+      "path": "packages/agent/test/tool-execution.test.ts",
+      "state": null
+    },
+    {
+      "path": "packages/coding-agent/src/core/agent-session-runtime.ts",
+      "state": {
+        "bytes": 15062,
+        "sha256": "ee66f90f4774ace21290fc6a0ed0fc2065376b57af4223371f1d1680b302036d"
+      }
+    },
+    {
+      "path": "packages/coding-agent/src/core/agent-session.ts",
+      "state": {
+        "bytes": 140613,
+        "sha256": "e5c020bced4ada5c5e116cbd160f66e111016fc717ae30d79994a45527e7f3d7"
+      }
+    },
+    {
+      "path": "packages/coding-agent/src/core/event-bus.ts",
+      "state": {
+        "bytes": 795,
+        "sha256": "fe5c39a57081fb9674c5bdc8c4bc6779bb8524c8895afc337af5ea517bdc71a2"
+      }
+    },
+    {
+      "path": "packages/coding-agent/src/core/extensions/index.ts",
+      "state": {
+        "bytes": 4652,
+        "sha256": "73f8b18ea7e72836dc90198bb74c29045f1d14571925fb706184c5eba6c7e666"
+      }
+    },
+    {
+      "path": "packages/coding-agent/src/core/extensions/runner.ts",
+      "state": {
+        "bytes": 46905,
+        "sha256": "bf68eaf27a3e54f1cfc0982554e0598c050fd9a06c8e8b7d6cd2d8e3d8d5990c"
+      }
+    },
+    {
+      "path": "packages/coding-agent/src/core/extensions/types.ts",
+      "state": {
+        "bytes": 67527,
+        "sha256": "601261b3deee1d61f85c930efed2767d66fe6c8d9637e19f4f53135b5fecf4d1"
+      }
+    },
+    {
+      "path": "packages/coding-agent/src/core/extensions/wrapper.ts",
+      "state": {
+        "bytes": 1155,
+        "sha256": "f71eaefd00aad08c8934fec1e5e89b49b048b599d26ff7fa01ca9780345188cd"
+      }
+    },
+    {
+      "path": "packages/coding-agent/src/core/tool-invocation-scope.ts",
+      "state": null
+    },
+    {
+      "path": "packages/coding-agent/src/core/tools/tool-definition-wrapper.ts",
+      "state": {
+        "bytes": 1870,
+        "sha256": "98c04e593457dfefdc4160fa84c4e16f1a693adad21672bdf1fbfa4912ef2f8b"
+      }
+    },
+    {
+      "path": "packages/coding-agent/src/index.ts",
+      "state": {
+        "bytes": 11517,
+        "sha256": "60472823b30980d1c482f6aed19e4cab09cfeddffaa3be570d67a6cc1d7af2a0"
+      }
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-guards.test.ts",
+      "state": null
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-lifecycle.test.ts",
+      "state": null
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-origin.test.ts",
+      "state": null
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-replacement.test.ts",
+      "state": null
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-invocation.test.ts",
+      "state": null
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts",
+      "state": null
+    },
+    {
+      "path": "packages/coding-agent/test/suite/harness.ts",
+      "state": {
+        "bytes": 7598,
+        "sha256": "efa33743617ff239a3d91b96ba10196d2ebbebab6fb52b3fcd74a1cc99030393"
+      }
+    },
+    {
+      "path": "packages/coding-agent/test/suite/host-invocation-lifecycle-fixture.ts",
+      "state": null
+    },
+    {
+      "path": "packages/coding-agent/test/suite/host-invocation-replacement-fixture.ts",
+      "state": null
+    }
+  ],
+  "stages": [
+    {
+      "stage": 1,
+      "title": "Execution extraction",
+      "depends_on": [],
+      "patch": {
+        "path": "patches/0001-execution-extraction.patch",
+        "bytes": 32060,
+        "sha256": "268153e8cec309743a556e9ee65bddcd12e3a6ffe778aa5ec758de11d496454d"
+      },
+      "declared_creations": [
+        "packages/agent/src/tool-execution.ts",
+        "packages/agent/test/tool-execution.test.ts"
+      ],
+      "files": [
+        {
+          "path": "packages/agent/src/agent-loop.ts",
+          "before": {
+            "bytes": 26649,
+            "sha256": "c3d99a5b0f24d1e7fde41cbeb2cd7a2f3559aa3e9c1df975abef21d7e0ecd189"
+          },
+          "after": {
+            "bytes": 21979,
+            "sha256": "800edcfbba2a9147b93d3617e11fa1546cb0064db94fc53b4b8c934d6d4e379a"
+          }
+        },
+        {
+          "path": "packages/agent/src/index.ts",
+          "before": {
+            "bytes": 4045,
+            "sha256": "f335c42e75a0ab39eab9d8a08a01cd8804b720ed89f1f0a25ea12239210132d3"
+          },
+          "after": {
+            "bytes": 4274,
+            "sha256": "9362cda7c068f4ee9aa7b679588408d2231f60db55824a010571708070942c88"
+          }
+        },
+        {
+          "path": "packages/agent/src/tool-execution.ts",
+          "before": null,
+          "after": {
+            "bytes": 5317,
+            "sha256": "b782908680d55d504dc542634b89dcd48afd9aef81543d7aac921ce1089997d8"
+          }
+        },
+        {
+          "path": "packages/agent/test/tool-execution.test.ts",
+          "before": null,
+          "after": {
+            "bytes": 18967,
+            "sha256": "480af48d058c07119a0602fc74b4705e00a3086345b1dee5c32565c7ac6d050a"
+          }
+        }
+      ],
+      "churn": {
+        "additions": 690,
+        "deletions": 208
+      }
+    },
+    {
+      "stage": 2,
+      "title": "Characterization tests",
+      "depends_on": [
+        1
+      ],
+      "patch": {
+        "path": "patches/0002-characterization-tests.patch",
+        "bytes": 11230,
+        "sha256": "b6de46f9966ec06d3b86d10e37cb1440dbbc7f8232f3ce1e71e36231ba8a85e0"
+      },
+      "declared_creations": [
+        "packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts"
+      ],
+      "files": [
+        {
+          "path": "packages/agent/test/tool-execution.test.ts",
+          "before": {
+            "bytes": 18967,
+            "sha256": "480af48d058c07119a0602fc74b4705e00a3086345b1dee5c32565c7ac6d050a"
+          },
+          "after": {
+            "bytes": 24251,
+            "sha256": "5631c70b665d5c3c130d81b5f3b45fd84bd41105580afbd6fc3bae8f8c7d6792"
+          }
+        },
+        {
+          "path": "packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts",
+          "before": null,
+          "after": {
+            "bytes": 5226,
+            "sha256": "fb1b29b85ae8e5c12fc79dc9937fbb0c0941970a01c81eb40b3f94eb552538b8"
+          }
+        }
+      ],
+      "churn": {
+        "additions": 201,
+        "deletions": 0
+      }
+    },
+    {
+      "stage": 3,
+      "title": "Neutral execution seam",
+      "depends_on": [
+        2
+      ],
+      "patch": {
+        "path": "patches/0003-neutral-execution-seam.patch",
+        "bytes": 17572,
+        "sha256": "70cdf91bb0df95fa584f0e4f2001055ee30e32f7127fed6d9b4f16929e03cff6"
+      },
+      "declared_creations": [],
+      "files": [
+        {
+          "path": "packages/agent/src/index.ts",
+          "before": {
+            "bytes": 4274,
+            "sha256": "9362cda7c068f4ee9aa7b679588408d2231f60db55824a010571708070942c88"
+          },
+          "after": {
+            "bytes": 4419,
+            "sha256": "208950a5e044b88bf0ff436e93c504e010d991ff700aafe7d0a31f906c2db1ed"
+          }
+        },
+        {
+          "path": "packages/agent/src/tool-execution.ts",
+          "before": {
+            "bytes": 5317,
+            "sha256": "b782908680d55d504dc542634b89dcd48afd9aef81543d7aac921ce1089997d8"
+          },
+          "after": {
+            "bytes": 7652,
+            "sha256": "fb87661b48bd5123d7591efa4b853a2ac67dac39dcbb4eefa858787957d056b2"
+          }
+        },
+        {
+          "path": "packages/agent/test/tool-execution.test.ts",
+          "before": {
+            "bytes": 24251,
+            "sha256": "5631c70b665d5c3c130d81b5f3b45fd84bd41105580afbd6fc3bae8f8c7d6792"
+          },
+          "after": {
+            "bytes": 30825,
+            "sha256": "c07dd5c236853e7432de30cd2c06965890f10156809a9ffd0714094b423f3f46"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/agent-session.ts",
+          "before": {
+            "bytes": 140613,
+            "sha256": "e5c020bced4ada5c5e116cbd160f66e111016fc717ae30d79994a45527e7f3d7"
+          },
+          "after": {
+            "bytes": 141128,
+            "sha256": "cf1539d2016d4f8fa4d95fdfa42115bb4b91e1f1058f31359c63778ded50f795"
+          }
+        },
+        {
+          "path": "packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts",
+          "before": {
+            "bytes": 5226,
+            "sha256": "fb1b29b85ae8e5c12fc79dc9937fbb0c0941970a01c81eb40b3f94eb552538b8"
+          },
+          "after": {
+            "bytes": 5243,
+            "sha256": "49cb820dceff231aae88ca7f6838fe278983959300f864b5d08a358c80e14a8a"
+          }
+        }
+      ],
+      "churn": {
+        "additions": 277,
+        "deletions": 57
+      }
+    },
+    {
+      "stage": 4,
+      "title": "Invocation capability",
+      "depends_on": [
+        3
+      ],
+      "patch": {
+        "path": "patches/0004-invocation-capability.patch",
+        "bytes": 39149,
+        "sha256": "4c7e2d663a36823085344168d72ccea601b802583bec6bcce3b0b7ee56434848"
+      },
+      "declared_creations": [
+        "packages/coding-agent/test/suite/agent-session-tool-invocation.test.ts"
+      ],
+      "files": [
+        {
+          "path": "packages/coding-agent/src/core/agent-session.ts",
+          "before": {
+            "bytes": 141128,
+            "sha256": "cf1539d2016d4f8fa4d95fdfa42115bb4b91e1f1058f31359c63778ded50f795"
+          },
+          "after": {
+            "bytes": 150904,
+            "sha256": "77ed3d077e9f6986ae98ce8b50fde5ad7ba0454aab6e0d8cc6b59b2221f18a7a"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/extensions/index.ts",
+          "before": {
+            "bytes": 4652,
+            "sha256": "73f8b18ea7e72836dc90198bb74c29045f1d14571925fb706184c5eba6c7e666"
+          },
+          "after": {
+            "bytes": 4698,
+            "sha256": "d8e2ed489ebd8d2cfc90eb687c436a45e650d1daf6d5ffe5480d5a326b8d9755"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/extensions/types.ts",
+          "before": {
+            "bytes": 67527,
+            "sha256": "601261b3deee1d61f85c930efed2767d66fe6c8d9637e19f4f53135b5fecf4d1"
+          },
+          "after": {
+            "bytes": 68176,
+            "sha256": "2fd33e384ea5a761bc56f314d384e7023b372aaf7112fc05b678ad55c89b5b6c"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/extensions/wrapper.ts",
+          "before": {
+            "bytes": 1155,
+            "sha256": "f71eaefd00aad08c8934fec1e5e89b49b048b599d26ff7fa01ca9780345188cd"
+          },
+          "after": {
+            "bytes": 1475,
+            "sha256": "17ae6920a16c8588f7c6ca31afa0c77a81de6b73a1abbb151d08e87cf25ef28a"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/tools/tool-definition-wrapper.ts",
+          "before": {
+            "bytes": 1870,
+            "sha256": "98c04e593457dfefdc4160fa84c4e16f1a693adad21672bdf1fbfa4912ef2f8b"
+          },
+          "after": {
+            "bytes": 3344,
+            "sha256": "826fcea334559afdb4418c4f996b55f3d1a3098d47014e6777a1612a23640451"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/index.ts",
+          "before": {
+            "bytes": 11517,
+            "sha256": "60472823b30980d1c482f6aed19e4cab09cfeddffaa3be570d67a6cc1d7af2a0"
+          },
+          "after": {
+            "bytes": 11657,
+            "sha256": "954c69050e0cc88aa08c1603774c41a3d64e37f4c94d852d014e470d6c81df52"
+          }
+        },
+        {
+          "path": "packages/coding-agent/test/suite/agent-session-tool-invocation.test.ts",
+          "before": null,
+          "after": {
+            "bytes": 13614,
+            "sha256": "fd1d31958d53b957e8a26b015b886dfc2961e0e0ca6644261389785ba65b2b5e"
+          }
+        },
+        {
+          "path": "packages/coding-agent/test/suite/harness.ts",
+          "before": {
+            "bytes": 7598,
+            "sha256": "efa33743617ff239a3d91b96ba10196d2ebbebab6fb52b3fcd74a1cc99030393"
+          },
+          "after": {
+            "bytes": 7745,
+            "sha256": "cca3dca3a2267fcd769bf50ef20c5213941674c01f166a6a875b8cabe8b6b383"
+          }
+        }
+      ],
+      "churn": {
+        "additions": 631,
+        "deletions": 44
+      }
+    },
+    {
+      "stage": 5,
+      "title": "Invocation guards",
+      "depends_on": [
+        4
+      ],
+      "patch": {
+        "path": "patches/0005-invocation-guards.patch",
+        "bytes": 20202,
+        "sha256": "b28afb99db3b0798e5046fca9a37b3040fa776669b5ba7fb75b587d8d0f778cf"
+      },
+      "declared_creations": [
+        "packages/coding-agent/test/suite/agent-session-tool-invocation-guards.test.ts"
+      ],
+      "files": [
+        {
+          "path": "packages/coding-agent/src/core/agent-session.ts",
+          "before": {
+            "bytes": 150904,
+            "sha256": "77ed3d077e9f6986ae98ce8b50fde5ad7ba0454aab6e0d8cc6b59b2221f18a7a"
+          },
+          "after": {
+            "bytes": 153378,
+            "sha256": "038ab5dd5c4ee43b5b4338c42db25ca42edaef2b4ef139d9a1fc622795faed66"
+          }
+        },
+        {
+          "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-guards.test.ts",
+          "before": null,
+          "after": {
+            "bytes": 12035,
+            "sha256": "8bb9c0ad3cdc811d957a9eb2faec217d407740a5cc6074337798b01e592334a2"
+          }
+        }
+      ],
+      "churn": {
+        "additions": 362,
+        "deletions": 17
+      }
+    },
+    {
+      "stage": 6,
+      "title": "Execution origin",
+      "depends_on": [
+        5
+      ],
+      "patch": {
+        "path": "patches/0006-execution-origin.patch",
+        "bytes": 24835,
+        "sha256": "3a21c03b8b0bfb6ce73900add5364dcc4271f67f10f13ae5b440589ec5aae946"
+      },
+      "declared_creations": [
+        "packages/coding-agent/src/core/tool-invocation-scope.ts",
+        "packages/coding-agent/test/suite/agent-session-tool-invocation-origin.test.ts"
+      ],
+      "files": [
+        {
+          "path": "packages/coding-agent/src/core/agent-session.ts",
+          "before": {
+            "bytes": 153378,
+            "sha256": "038ab5dd5c4ee43b5b4338c42db25ca42edaef2b4ef139d9a1fc622795faed66"
+          },
+          "after": {
+            "bytes": 153779,
+            "sha256": "1e56261a164f9926c2156bec85824c0519ddb0a0089dd3ab4d0c4aeb761982a1"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/event-bus.ts",
+          "before": {
+            "bytes": 795,
+            "sha256": "fe5c39a57081fb9674c5bdc8c4bc6779bb8524c8895afc337af5ea517bdc71a2"
+          },
+          "after": {
+            "bytes": 904,
+            "sha256": "08938c8115ad6c141663101c640fa33cac7751cc0bac5990d2bd642a839a2da9"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/extensions/runner.ts",
+          "before": {
+            "bytes": 46905,
+            "sha256": "bf68eaf27a3e54f1cfc0982554e0598c050fd9a06c8e8b7d6cd2d8e3d8d5990c"
+          },
+          "after": {
+            "bytes": 47223,
+            "sha256": "ddae1bdfb3eb5fb5544a4d880d568f8d531baba13f7ecfca93a8099de861407f"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/tool-invocation-scope.ts",
+          "before": null,
+          "after": {
+            "bytes": 861,
+            "sha256": "1468231b166c0b24ca00dcbf225c88920b4a4608c2ec9dd36d1c487cc0baa62d"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/tools/tool-definition-wrapper.ts",
+          "before": {
+            "bytes": 3344,
+            "sha256": "826fcea334559afdb4418c4f996b55f3d1a3098d47014e6777a1612a23640451"
+          },
+          "after": {
+            "bytes": 3467,
+            "sha256": "9a1d8c41cc48346fe82f4a9d71eafec8e5f91dad8cf4015553751a0d68251d57"
+          }
+        },
+        {
+          "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-origin.test.ts",
+          "before": null,
+          "after": {
+            "bytes": 15767,
+            "sha256": "423d224857ad8281072adb2abcfb598138284805642ba33af79501f4a6d3d989"
+          }
+        }
+      ],
+      "churn": {
+        "additions": 399,
+        "deletions": 19
+      }
+    },
+    {
+      "stage": 7,
+      "title": "Lifecycle admission (B1)",
+      "depends_on": [
+        6
+      ],
+      "patch": {
+        "path": "patches/0007-lifecycle-admission.patch",
+        "bytes": 37323,
+        "sha256": "c75e0034b0d9a4ac33e2382dd2d9cf8b2686e1b89f8e66ab2cbcd38bb1db8cef"
+      },
+      "declared_creations": [
+        "packages/coding-agent/test/suite/agent-session-tool-invocation-lifecycle.test.ts",
+        "packages/coding-agent/test/suite/host-invocation-lifecycle-fixture.ts"
+      ],
+      "files": [
+        {
+          "path": "packages/coding-agent/src/core/agent-session-runtime.ts",
+          "before": {
+            "bytes": 15062,
+            "sha256": "ee66f90f4774ace21290fc6a0ed0fc2065376b57af4223371f1d1680b302036d"
+          },
+          "after": {
+            "bytes": 15112,
+            "sha256": "ff03029f5339b0f49855a029725ad912832ae4c51d306bb6948085229be84465"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/agent-session.ts",
+          "before": {
+            "bytes": 153779,
+            "sha256": "1e56261a164f9926c2156bec85824c0519ddb0a0089dd3ab4d0c4aeb761982a1"
+          },
+          "after": {
+            "bytes": 156526,
+            "sha256": "93cb5c286292bcc5cc96fa868e4595d4fd14d1eeaf4ad09f9862dd02ba1898d4"
+          }
+        },
+        {
+          "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-lifecycle.test.ts",
+          "before": null,
+          "after": {
+            "bytes": 15820,
+            "sha256": "03d29e6aadd52690a42cfb74e5b87913fe00af8a56ceceb5b4be69db33aba676"
+          }
+        },
+        {
+          "path": "packages/coding-agent/test/suite/host-invocation-lifecycle-fixture.ts",
+          "before": null,
+          "after": {
+            "bytes": 12129,
+            "sha256": "a568c1ef9852e2cafa00a71f0fdfe9d5b91e7610c3db44217b5a619cc89fdc91"
+          }
+        }
+      ],
+      "churn": {
+        "additions": 736,
+        "deletions": 33
+      }
+    },
+    {
+      "stage": 8,
+      "title": "Replacement veto (B2)",
+      "depends_on": [
+        7
+      ],
+      "patch": {
+        "path": "patches/0008-replacement-veto.patch",
+        "bytes": 38968,
+        "sha256": "90b8ed0811ed5086dd8d70a636b1bdcb800d06830113ddd12573620b13df61ff"
+      },
+      "declared_creations": [
+        "packages/coding-agent/test/suite/agent-session-tool-invocation-replacement.test.ts",
+        "packages/coding-agent/test/suite/host-invocation-replacement-fixture.ts"
+      ],
+      "files": [
+        {
+          "path": "packages/coding-agent/src/core/agent-session-runtime.ts",
+          "before": {
+            "bytes": 15112,
+            "sha256": "ff03029f5339b0f49855a029725ad912832ae4c51d306bb6948085229be84465"
+          },
+          "after": {
+            "bytes": 18293,
+            "sha256": "8fc4e92118dba1c9cb41527595b3e89f935da0960896459a71c1f8af606a5ea5"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/agent-session.ts",
+          "before": {
+            "bytes": 156526,
+            "sha256": "93cb5c286292bcc5cc96fa868e4595d4fd14d1eeaf4ad09f9862dd02ba1898d4"
+          },
+          "after": {
+            "bytes": 156977,
+            "sha256": "07af9ceed97dc90e23b123c4834eaefd495378860c91870d7a06aa54e7fd4396"
+          }
+        },
+        {
+          "path": "packages/coding-agent/src/core/extensions/runner.ts",
+          "before": {
+            "bytes": 47223,
+            "sha256": "ddae1bdfb3eb5fb5544a4d880d568f8d531baba13f7ecfca93a8099de861407f"
+          },
+          "after": {
+            "bytes": 47907,
+            "sha256": "3d35938eefda7b45e07c8c507774d814fc91ba4b0978ac0bad1909d5644965b1"
+          }
+        },
+        {
+          "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-replacement.test.ts",
+          "before": null,
+          "after": {
+            "bytes": 6926,
+            "sha256": "7b8fd1a99564fa0a30ba928a5c74f283a558bf5c32a0aaf9f3ba6f546bcb8022"
+          }
+        },
+        {
+          "path": "packages/coding-agent/test/suite/host-invocation-replacement-fixture.ts",
+          "before": null,
+          "after": {
+            "bytes": 10392,
+            "sha256": "411f1daea09b0303269fdbc90aebfd3d0c1d30457b91e62688afa79b5959387e"
+          }
+        }
+      ],
+      "churn": {
+        "additions": 653,
+        "deletions": 156
+      }
+    }
+  ],
+  "final_files": [
+    {
+      "path": "packages/agent/src/agent-loop.ts",
+      "bytes": 21979,
+      "sha256": "800edcfbba2a9147b93d3617e11fa1546cb0064db94fc53b4b8c934d6d4e379a"
+    },
+    {
+      "path": "packages/agent/src/index.ts",
+      "bytes": 4419,
+      "sha256": "208950a5e044b88bf0ff436e93c504e010d991ff700aafe7d0a31f906c2db1ed"
+    },
+    {
+      "path": "packages/agent/src/tool-execution.ts",
+      "bytes": 7652,
+      "sha256": "fb87661b48bd5123d7591efa4b853a2ac67dac39dcbb4eefa858787957d056b2"
+    },
+    {
+      "path": "packages/agent/test/tool-execution.test.ts",
+      "bytes": 30825,
+      "sha256": "c07dd5c236853e7432de30cd2c06965890f10156809a9ffd0714094b423f3f46"
+    },
+    {
+      "path": "packages/coding-agent/src/core/agent-session-runtime.ts",
+      "bytes": 18293,
+      "sha256": "8fc4e92118dba1c9cb41527595b3e89f935da0960896459a71c1f8af606a5ea5"
+    },
+    {
+      "path": "packages/coding-agent/src/core/agent-session.ts",
+      "bytes": 156977,
+      "sha256": "07af9ceed97dc90e23b123c4834eaefd495378860c91870d7a06aa54e7fd4396"
+    },
+    {
+      "path": "packages/coding-agent/src/core/event-bus.ts",
+      "bytes": 904,
+      "sha256": "08938c8115ad6c141663101c640fa33cac7751cc0bac5990d2bd642a839a2da9"
+    },
+    {
+      "path": "packages/coding-agent/src/core/extensions/index.ts",
+      "bytes": 4698,
+      "sha256": "d8e2ed489ebd8d2cfc90eb687c436a45e650d1daf6d5ffe5480d5a326b8d9755"
+    },
+    {
+      "path": "packages/coding-agent/src/core/extensions/runner.ts",
+      "bytes": 47907,
+      "sha256": "3d35938eefda7b45e07c8c507774d814fc91ba4b0978ac0bad1909d5644965b1"
+    },
+    {
+      "path": "packages/coding-agent/src/core/extensions/types.ts",
+      "bytes": 68176,
+      "sha256": "2fd33e384ea5a761bc56f314d384e7023b372aaf7112fc05b678ad55c89b5b6c"
+    },
+    {
+      "path": "packages/coding-agent/src/core/extensions/wrapper.ts",
+      "bytes": 1475,
+      "sha256": "17ae6920a16c8588f7c6ca31afa0c77a81de6b73a1abbb151d08e87cf25ef28a"
+    },
+    {
+      "path": "packages/coding-agent/src/core/tool-invocation-scope.ts",
+      "bytes": 861,
+      "sha256": "1468231b166c0b24ca00dcbf225c88920b4a4608c2ec9dd36d1c487cc0baa62d"
+    },
+    {
+      "path": "packages/coding-agent/src/core/tools/tool-definition-wrapper.ts",
+      "bytes": 3467,
+      "sha256": "9a1d8c41cc48346fe82f4a9d71eafec8e5f91dad8cf4015553751a0d68251d57"
+    },
+    {
+      "path": "packages/coding-agent/src/index.ts",
+      "bytes": 11657,
+      "sha256": "954c69050e0cc88aa08c1603774c41a3d64e37f4c94d852d014e470d6c81df52"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-guards.test.ts",
+      "bytes": 12035,
+      "sha256": "8bb9c0ad3cdc811d957a9eb2faec217d407740a5cc6074337798b01e592334a2"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-lifecycle.test.ts",
+      "bytes": 15820,
+      "sha256": "03d29e6aadd52690a42cfb74e5b87913fe00af8a56ceceb5b4be69db33aba676"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-origin.test.ts",
+      "bytes": 15767,
+      "sha256": "423d224857ad8281072adb2abcfb598138284805642ba33af79501f4a6d3d989"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-invocation-replacement.test.ts",
+      "bytes": 6926,
+      "sha256": "7b8fd1a99564fa0a30ba928a5c74f283a558bf5c32a0aaf9f3ba6f546bcb8022"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-invocation.test.ts",
+      "bytes": 13614,
+      "sha256": "fd1d31958d53b957e8a26b015b886dfc2961e0e0ca6644261389785ba65b2b5e"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts",
+      "bytes": 5243,
+      "sha256": "49cb820dceff231aae88ca7f6838fe278983959300f864b5d08a358c80e14a8a"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/harness.ts",
+      "bytes": 7745,
+      "sha256": "cca3dca3a2267fcd769bf50ef20c5213941674c01f166a6a875b8cabe8b6b383"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/host-invocation-lifecycle-fixture.ts",
+      "bytes": 12129,
+      "sha256": "a568c1ef9852e2cafa00a71f0fdfe9d5b91e7610c3db44217b5a619cc89fdc91"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/host-invocation-replacement-fixture.ts",
+      "bytes": 10392,
+      "sha256": "411f1daea09b0303269fdbc90aebfd3d0c1d30457b91e62688afa79b5959387e"
+    }
+  ],
+  "verification": {
+    "archive_sha256_and_selected_base_preimages": "passed-during-generation",
+    "seven_prerequisite_endpoints_and_carry": "passed-during-generation",
+    "b1_three_preimages_and_current_eighteen_carried_files": "passed-during-generation",
+    "eight_canonical_patches_strict_in_memory_replay": "passed-during-generation",
+    "final_twenty_three_source_files": "matched-during-generation",
+    "payload_privacy_scan_and_license": "passed-during-generation",
+    "independent_filesystem_git_apply_and_readback": "passed-in-fresh-selected-source-test-copy",
+    "reconstructed_copy_runtime_tests_and_typecheck": "not-run",
+    "native_review_of_this_package": "eight-patch-artifact-units-approved-and-acknowledged"
+  }
+}
