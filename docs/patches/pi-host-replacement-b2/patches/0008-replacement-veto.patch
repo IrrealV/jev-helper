@@ -1,0 +1,949 @@
+diff --git a/packages/coding-agent/src/core/agent-session-runtime.ts b/packages/coding-agent/src/core/agent-session-runtime.ts
+--- a/packages/coding-agent/src/core/agent-session-runtime.ts
++++ b/packages/coding-agent/src/core/agent-session-runtime.ts
+@@ -6,10 +6,12 @@
+ import type {
+ 	ProjectTrustContext,
+ 	ReplacedSessionContext,
++	SessionBeforeForkEvent,
++	SessionBeforeSwitchEvent,
+ 	SessionShutdownEvent,
+ 	SessionStartEvent,
+ } from "./extensions/index.ts";
+-import { emitSessionShutdownEvent } from "./extensions/runner.ts";
++import { emitSessionShutdownEvent, type ExtensionRunner } from "./extensions/runner.ts";
+ import type { CreateAgentSessionResult } from "./sdk.ts";
+ import { assertSessionCwdExists } from "./session-cwd.ts";
+ import { SessionManager } from "./session-manager.ts";
+@@ -63,6 +65,13 @@
+ 		.map((part) => part.text)
+ 		.join("");
+ }
++
++type ReplacementTransition = {
++	session: AgentSession;
++	runner: ExtensionRunner;
++	services: AgentSessionServices;
++	generation: bigint;
++};
+ 
+ /**
+  * Owns the current AgentSession plus its cwd-bound services.
+@@ -79,6 +88,8 @@
+ 	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
+ 	private _diagnostics: AgentSessionRuntimeDiagnostic[];
+ 	private _modelFallbackMessage?: string;
++	private replacementGeneration = 0n;
++	private disposed = false;
+ 
+ 	constructor(
+ 		_session: AgentSession,
+@@ -147,34 +158,72 @@
+ 		return { cancelled: result?.cancel === true };
+ 	}
+ 
+-	private async emitBeforeFork(
+-		entryId: string,
+-		options: { position: "before" | "at" },
+-	): Promise<{ cancelled: boolean }> {
+-		const runner = this.session.extensionRunner;
+-		if (!runner.hasHandlers("session_before_fork")) {
+-			return { cancelled: false };
+-		}
+-
+-		const result = await runner.emit({
+-			type: "session_before_fork",
+-			entryId,
+-			...options,
++	private async runReplacement<T extends { cancelled: boolean }>(
++		event: SessionBeforeSwitchEvent | SessionBeforeForkEvent,
++		replace: (transition: ReplacementTransition) => Promise<T>,
++	): Promise<T | { cancelled: true }> {
++		const session = this.session;
++		const transition: ReplacementTransition = {
++			session, runner: session.extensionRunner, services: this.services,
++			generation: ++this.replacementGeneration,
++		};
++		// Close before the first hook can run, including its synchronous prefix.
++		const finish = session.beginToolInvocationReplacement();
++		let succeeded = false;
++		try {
++			this.assertReplacementCurrent(transition);
++			const outcome = transition.runner.hasHandlers(event.type)
++				? await transition.runner.emitReplacementBefore(event)
++				: { result: undefined, hadHandlerError: false };
++			if (outcome.result?.cancel === true) {
++				succeeded = !outcome.hadHandlerError;
++				return { cancelled: true };
++			}
++			this.assertReplacementCurrent(transition);
++			const result = await replace(transition);
++			succeeded = !outcome.hadHandlerError;
++			return result;
++		} finally {
++			// Never finish against a replacement session adopted during an await.
++			finish(succeeded);
++		}
++	}
++
++	private assertReplacementCurrent(transition: ReplacementTransition, session = transition.session): void {
++		if (this.disposed || this.replacementGeneration !== transition.generation || this.session !== session ||
++			(session === transition.session && session.extensionRunner !== transition.runner)) {
++			throw new Error("Session replacement was superseded or disposed");
++		}
++	}
++
++	private async teardownCurrent(
++		reason: SessionShutdownEvent["reason"],
++		targetSessionFile?: string,
++		transition?: ReplacementTransition,
++	): Promise<void> {
++		if (transition) this.assertReplacementCurrent(transition);
++		// Owned replacements use captured bindings; the import caller keeps its existing path.
++		// Settle the outgoing response before shutdown and invalidation.
++		await (transition?.session ?? this.session).abort();
++		if (transition) this.assertReplacementCurrent(transition);
++		await emitSessionShutdownEvent(transition?.runner ?? this.session.extensionRunner, {
++			type: "session_shutdown", reason, targetSessionFile,
+ 		});
+-		return { cancelled: result?.cancel === true };
+-	}
+-
+-	private async teardownCurrent(reason: SessionShutdownEvent["reason"], targetSessionFile?: string): Promise<void> {
+-		// Settle any active response first so the aborted turn (including tool
+-		// results) is persisted to the outgoing session before it is replaced.
+-		await this.session.abort();
+-		await emitSessionShutdownEvent(this.session.extensionRunner, {
+-			type: "session_shutdown",
+-			reason,
+-			targetSessionFile,
+-		});
++		if (transition) this.assertReplacementCurrent(transition);
+ 		this.beforeSessionInvalidate?.();
+-		this.session.dispose();
++		if (transition) this.assertReplacementCurrent(transition);
++		(transition?.session ?? this.session).dispose();
++	}
++
++	private applyReplacement(transition: ReplacementTransition, result: CreateAgentSessionRuntimeResult): void {
++		try {
++			this.assertReplacementCurrent(transition);
++		} catch (error) {
++			// A factory may finish after a newer transition or runtime disposal.
++			result.session.dispose();
++			throw error;
++		}
++		this.apply(result);
+ 	}
+ 
+ 	private apply(result: CreateAgentSessionRuntimeResult): void {
+@@ -184,13 +233,20 @@
+ 		this._modelFallbackMessage = result.modelFallbackMessage;
+ 	}
+ 
+-	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
++	private async finishSessionReplacement(
++		withSession?: (ctx: ReplacedSessionContext) => Promise<void>,
++		transition?: ReplacementTransition,
++		session?: AgentSession,
++	): Promise<void> {
++		if (transition) this.assertReplacementCurrent(transition, session);
+ 		if (this.rebindSession) {
+-			await this.rebindSession(this.session);
+-		}
++			await this.rebindSession(session ?? this.session);
++		}
++		if (transition) this.assertReplacementCurrent(transition, session);
+ 		if (withSession) {
+-			await withSession(this.session.createReplacedSessionContext());
+-		}
++			await withSession((session ?? this.session).createReplacedSessionContext());
++		}
++		if (transition) this.assertReplacementCurrent(transition, session);
+ 	}
+ 
+ 	async switchSession(
+@@ -201,26 +257,25 @@
+ 			projectTrustContextFactory?: (cwd: string) => ProjectTrustContext;
+ 		},
+ 	): Promise<{ cancelled: boolean }> {
+-		const beforeResult = await this.emitBeforeSwitch("resume", sessionPath);
+-		if (beforeResult.cancelled) {
+-			return beforeResult;
+-		}
+-
+-		const previousSessionFile = this.session.sessionFile;
+-		const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+-		assertSessionCwdExists(sessionManager, this.cwd);
+-		await this.teardownCurrent("resume", sessionManager.getSessionFile());
+-		this.apply(
+-			await this.createRuntime({
++		return this.runReplacement({
++			type: "session_before_switch", reason: "resume", targetSessionFile: sessionPath,
++		}, async (transition) => {
++			const { session, services } = transition;
++			const previousSessionFile = session.sessionFile;
++			const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
++			assertSessionCwdExists(sessionManager, services.cwd);
++			await this.teardownCurrent("resume", sessionManager.getSessionFile(), transition);
++			const result = await this.createRuntime({
+ 				cwd: sessionManager.getCwd(),
+-				agentDir: this.services.agentDir,
++				agentDir: services.agentDir,
+ 				sessionManager,
+ 				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+ 				projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
+-			}),
+-		);
+-		await this.finishSessionReplacement(options?.withSession);
+-		return { cancelled: false };
++			});
++			this.applyReplacement(transition, result);
++			await this.finishSessionReplacement(options?.withSession, transition, result.session);
++			return { cancelled: false };
++		});
+ 	}
+ 
+ 	async newSession(options?: {
+@@ -228,35 +283,35 @@
+ 		setup?: (sessionManager: SessionManager) => Promise<void>;
+ 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+ 	}): Promise<{ cancelled: boolean }> {
+-		const beforeResult = await this.emitBeforeSwitch("new");
+-		if (beforeResult.cancelled) {
+-			return beforeResult;
+-		}
+-
+-		const previousSessionFile = this.session.sessionFile;
+-		const sessionDir = this.session.sessionManager.getSessionDir();
+-		const sessionManager = this.session.sessionManager.isPersisted()
+-			? SessionManager.create(this.cwd, sessionDir)
+-			: SessionManager.inMemory(this.cwd);
+-		if (options?.parentSession) {
+-			sessionManager.newSession({ parentSession: options.parentSession });
+-		}
+-
+-		await this.teardownCurrent("new", sessionManager.getSessionFile());
+-		this.apply(
+-			await this.createRuntime({
+-				cwd: this.cwd,
+-				agentDir: this.services.agentDir,
++		return this.runReplacement({
++			type: "session_before_switch", reason: "new", targetSessionFile: undefined,
++		}, async (transition) => {
++			const { session, services } = transition;
++			const previousSessionFile = session.sessionFile;
++			const sessionDir = session.sessionManager.getSessionDir();
++			const sessionManager = session.sessionManager.isPersisted()
++				? SessionManager.create(services.cwd, sessionDir)
++				: SessionManager.inMemory(services.cwd);
++			if (options?.parentSession) {
++				sessionManager.newSession({ parentSession: options.parentSession });
++			}
++
++			await this.teardownCurrent("new", sessionManager.getSessionFile(), transition);
++			const result = await this.createRuntime({
++				cwd: services.cwd,
++				agentDir: services.agentDir,
+ 				sessionManager,
+ 				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+-			}),
+-		);
+-		if (options?.setup) {
+-			await options.setup(this.session.sessionManager);
+-			this.session.refreshContext();
+-		}
+-		await this.finishSessionReplacement(options?.withSession);
+-		return { cancelled: false };
++			});
++			this.applyReplacement(transition, result);
++			if (options?.setup) {
++				await options.setup(result.session.sessionManager);
++				this.assertReplacementCurrent(transition, result.session);
++				result.session.refreshContext();
++			}
++			await this.finishSessionReplacement(options?.withSession, transition, result.session);
++			return { cancelled: false };
++		});
+ 	}
+ 
+ 	async fork(
+@@ -264,91 +319,87 @@
+ 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+ 	): Promise<{ cancelled: boolean; selectedText?: string }> {
+ 		const position = options?.position ?? "before";
+-		const beforeResult = await this.emitBeforeFork(entryId, { position });
+-		if (beforeResult.cancelled) {
+-			return { cancelled: true };
+-		}
+-		let targetLeafId: string | null;
+-		let selectedText: string | undefined;
+-
+-		const selectedEntry = this.session.sessionManager.getEntry(entryId);
+-		if (!selectedEntry) {
+-			throw new Error("Invalid entry ID for forking");
+-		}
+-
+-		if (position === "at") {
+-			targetLeafId = selectedEntry.id;
+-		} else {
+-			if (selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
++		return this.runReplacement({ type: "session_before_fork", entryId, position }, async (transition) => {
++			const { session, services } = transition;
++			let targetLeafId: string | null;
++			let selectedText: string | undefined;
++
++			const selectedEntry = session.sessionManager.getEntry(entryId);
++			if (!selectedEntry) {
+ 				throw new Error("Invalid entry ID for forking");
+ 			}
+-			targetLeafId = selectedEntry.parentId;
+-			selectedText = extractUserMessageText(selectedEntry.message.content);
+-		}
+-
+-		const previousSessionFile = this.session.sessionFile;
+-		if (this.session.sessionManager.isPersisted()) {
+-			const currentSessionFile = this.session.sessionFile;
+-			if (!currentSessionFile) {
+-				throw new Error("Persisted session is missing a session file");
+-			}
+-			const sessionDir = this.session.sessionManager.getSessionDir();
+-			if (!targetLeafId) {
+-				const sessionManager = SessionManager.create(this.cwd, sessionDir);
+-				sessionManager.newSession({ parentSession: currentSessionFile });
+-				await this.teardownCurrent("fork", sessionManager.getSessionFile());
+-				this.apply(
+-					await this.createRuntime({
+-						cwd: this.cwd,
+-						agentDir: this.services.agentDir,
++
++			if (position === "at") {
++				targetLeafId = selectedEntry.id;
++			} else {
++				if (selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
++					throw new Error("Invalid entry ID for forking");
++				}
++				targetLeafId = selectedEntry.parentId;
++				selectedText = extractUserMessageText(selectedEntry.message.content);
++			}
++
++			const previousSessionFile = session.sessionFile;
++			if (session.sessionManager.isPersisted()) {
++				const currentSessionFile = session.sessionFile;
++				if (!currentSessionFile) {
++					throw new Error("Persisted session is missing a session file");
++				}
++				const sessionDir = session.sessionManager.getSessionDir();
++				if (!targetLeafId) {
++					const sessionManager = SessionManager.create(services.cwd, sessionDir);
++					sessionManager.newSession({ parentSession: currentSessionFile });
++					await this.teardownCurrent("fork", sessionManager.getSessionFile(), transition);
++					const result = await this.createRuntime({
++						cwd: services.cwd,
++						agentDir: services.agentDir,
+ 						sessionManager,
+ 						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+-					}),
+-				);
+-				await this.finishSessionReplacement(options?.withSession);
+-				return { cancelled: false, selectedText };
+-			}
+-
+-			if (!existsSync(currentSessionFile)) {
+-				throw new Error(
+-					"This session has not been saved yet. Wait for the first assistant response before cloning or forking it.",
+-				);
+-			}
+-			const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
+-			const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
+-			if (!forkedSessionPath) {
+-				throw new Error("Failed to create forked session");
+-			}
+-			await this.teardownCurrent("fork", sessionManager.getSessionFile());
+-			this.apply(
+-				await this.createRuntime({
++					});
++					this.applyReplacement(transition, result);
++					await this.finishSessionReplacement(options?.withSession, transition, result.session);
++					return { cancelled: false, selectedText };
++				}
++
++				if (!existsSync(currentSessionFile)) {
++					throw new Error(
++						"This session has not been saved yet. Wait for the first assistant response before cloning or forking it.",
++					);
++				}
++				const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
++				const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
++				if (!forkedSessionPath) {
++					throw new Error("Failed to create forked session");
++				}
++				await this.teardownCurrent("fork", sessionManager.getSessionFile(), transition);
++				const result = await this.createRuntime({
+ 					cwd: sessionManager.getCwd(),
+-					agentDir: this.services.agentDir,
++					agentDir: services.agentDir,
+ 					sessionManager,
+ 					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+-				}),
+-			);
+-			await this.finishSessionReplacement(options?.withSession);
+-			return { cancelled: false, selectedText };
+-		}
+-
+-		const sessionManager = this.session.sessionManager;
+-		await this.teardownCurrent("fork", sessionManager.getSessionFile());
+-		if (!targetLeafId) {
+-			sessionManager.newSession({ parentSession: previousSessionFile });
+-		} else {
+-			sessionManager.createBranchedSession(targetLeafId);
+-		}
+-		this.apply(
+-			await this.createRuntime({
+-				cwd: this.cwd,
+-				agentDir: this.services.agentDir,
++				});
++				this.applyReplacement(transition, result);
++				await this.finishSessionReplacement(options?.withSession, transition, result.session);
++				return { cancelled: false, selectedText };
++			}
++
++			const sessionManager = session.sessionManager;
++			await this.teardownCurrent("fork", sessionManager.getSessionFile(), transition);
++			if (!targetLeafId) {
++				sessionManager.newSession({ parentSession: previousSessionFile });
++			} else {
++				sessionManager.createBranchedSession(targetLeafId);
++			}
++			const result = await this.createRuntime({
++				cwd: services.cwd,
++				agentDir: services.agentDir,
+ 				sessionManager,
+ 				sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+-			}),
+-		);
+-		await this.finishSessionReplacement(options?.withSession);
+-		return { cancelled: false, selectedText };
++			});
++			this.applyReplacement(transition, result);
++			await this.finishSessionReplacement(options?.withSession, transition, result.session);
++			return { cancelled: false, selectedText };
++		});
+ 	}
+ 
+ 	/**
+@@ -404,13 +455,17 @@
+ 	}
+ 
+ 	async dispose(): Promise<void> {
+-		this.session.closeToolInvocationsForDisposal();
+-		await emitSessionShutdownEvent(this.session.extensionRunner, {
++		const session = this.session;
++		const runner = session.extensionRunner;
++		this.disposed = true;
++		this.replacementGeneration++;
++		session.closeToolInvocationsForDisposal();
++		await emitSessionShutdownEvent(runner, {
+ 			type: "session_shutdown",
+ 			reason: "quit",
+ 		});
+ 		this.beforeSessionInvalidate?.();
+-		this.session.dispose();
++		session.dispose();
+ 	}
+ }
+ 
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -710,12 +710,16 @@
+ 		return ++this._toolInvocationGeneration;
+ 	}
+ 
+-	private _finishToolInvocationTransition(generation: bigint, kind: "abort" | "reload", succeeded: boolean): void {
++	private _finishToolInvocationTransition(
++		generation: bigint,
++		kind: "abort" | "reload" | "replacement",
++		succeeded: boolean,
++	): void {
+ 		this._toolInvocationTransitions--;
+ 		if (!succeeded) {
+ 			// Even an older failure revokes newer captures/completions already in flight.
+ 			const failureGeneration = ++this._toolInvocationGeneration;
+-			if (kind === "reload") this._toolInvocationReloadFailure = failureGeneration;
++			if (kind === "reload" || kind === "replacement") this._toolInvocationReloadFailure = failureGeneration;
+ 			return;
+ 		}
+ 		if (kind === "reload" && this._toolInvocationReloadFailure !== undefined &&
+@@ -729,6 +733,17 @@
+ 		// A newest successful completion can await older operations' bookkeeping,
+ 		// but an older success cannot grant readiness to a newer pending transition.
+ 		// This gates only invokeTool; it adds no waits to ordinary session operations.
++	}
++
++	/** @internal Close synchronously; the returned completion belongs only to this session. */
++	beginToolInvocationReplacement(): (succeeded: boolean) => void {
++		const generation = this._beginToolInvocationTransition();
++		let settled = false;
++		return (succeeded) => {
++			if (settled) return;
++			settled = true;
++			this._finishToolInvocationTransition(generation, "replacement", succeeded);
++		};
+ 	}
+ 
+ 	/** @internal Close-only runtime disposal bridge; never grants authority or invalidates cleanup contexts. */
+diff --git a/packages/coding-agent/src/core/extensions/runner.ts b/packages/coding-agent/src/core/extensions/runner.ts
+--- a/packages/coding-agent/src/core/extensions/runner.ts
++++ b/packages/coding-agent/src/core/extensions/runner.ts
+@@ -993,6 +993,22 @@
+ 	}
+ 
+ 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
++		return this.emitInternal(event);
++	}
++
++	/** @internal Per-emission diagnostics for cancellable runtime replacement hooks only. */
++	async emitReplacementBefore<TEvent extends Extract<RunnerEmitEvent, {
++		type: "session_before_switch" | "session_before_fork";
++	}>>(event: TEvent): Promise<{ result: RunnerEmitResult<TEvent>; hadHandlerError: boolean }> {
++		let hadHandlerError = false;
++		const result = await this.emitInternal(event, () => { hadHandlerError = true; });
++		return { result, hadHandlerError };
++	}
++
++	private async emitInternal<TEvent extends RunnerEmitEvent>(
++		event: TEvent,
++		onHandlerError?: () => void,
++	): Promise<RunnerEmitResult<TEvent>> {
+ 		const ctx = this.createContext();
+ 		let result: SessionBeforeEventResult | undefined;
+ 
+@@ -1008,6 +1024,7 @@
+ 						}
+ 					}
+ 				} catch (err) {
++					onHandlerError?.();
+ 					const message = err instanceof Error ? err.message : String(err);
+ 					const stack = err instanceof Error ? err.stack : undefined;
+ 					this.emitError({
+diff --git a/packages/coding-agent/test/suite/agent-session-tool-invocation-replacement.test.ts b/packages/coding-agent/test/suite/agent-session-tool-invocation-replacement.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/coding-agent/test/suite/agent-session-tool-invocation-replacement.test.ts
+@@ -0,0 +1,162 @@
++import { join } from "node:path";
++import { describe, expect, it } from "vitest";
++import type { ToolExecutionContext, ToolInvocationResult } from "../../src/core/extensions/types.ts";
++import { createReplacementFixture, hookFailure, type ReplacementKind } from "./host-invocation-replacement-fixture.ts";
++
++type Fixture = Awaited<ReturnType<typeof createReplacementFixture>>;
++type Owner = ReturnType<Fixture["startOwner"]>;
++
++function authority(f: Fixture) {
++	return { session: f.runtime.session, id: f.session.sessionId, runner: f.session.extensionRunner,
++		registrations: f.session.extensionRunner.getAllRegisteredTools() };
++}
++
++function expectLiveOwner(f: Fixture, owner: Owner, ctx: ToolExecutionContext, saved: ReturnType<typeof authority>) {
++	expect(f.runtime.session).toBe(saved.session);
++	expect(f.session.sessionId).toBe(saved.id);
++	expect(f.session.extensionRunner).toBe(saved.runner);
++	expect(f.session.getActiveToolNames().sort()).toEqual(["owner", "target"]);
++	expect(saved.registrations).toHaveLength(2);
++	for (const registration of saved.registrations) {
++		expect(saved.runner.getAllRegisteredTools().find((tool) => tool.definition.name === registration.definition.name))
++			.toBe(registration);
++	}
++	expect(ctx.cwd).toBe(f.cwd);
++	expect(ctx.signal?.aborted).toBe(false);
++	expect(owner.state.returned).toBe(false);
++	expect(owner.state.attempts).toBe(0);
++}
++
++function expectBeforeEvent(f: Fixture, kind: ReplacementKind) {
++	const event = kind === "fork"
++		? { type: "session_before_fork", entryId: "b2-missing-entry", position: "at" }
++		: { type: "session_before_switch", reason: kind === "new" ? "new" : "resume",
++			targetSessionFile: kind === "new" ? undefined : join(f.cwd, "missing-session.jsonl") };
++	expect(f.beforeEvents).toEqual([event]);
++	expect(f.lifecycle).toEqual(["start:1:startup"]);
++}
++
++async function invokeOwner(f: Fixture, owner: Owner, ctx: ToolExecutionContext) {
++	owner.state.proceed.release();
++	const result = await f.wait(owner.state.result.promise, owner.prompt);
++	expect(owner.state.attempts).toBe(1);
++	expect(owner.state.returned).toBe(false);
++	expect(ctx.signal?.aborted).toBe(false);
++	return result;
++}
++
++function expectDenied(result: ToolInvocationResult, id: string) {
++	expect(result.isError, `${id}: replacement admission must deny`).toBe(true);
++	expect(result.content).not.toEqual([{ type: "text", text: "usable target content" }]);
++	expect("usage" in result).toBe(false);
++}
++
++async function finishOwner(owner: Owner) {
++	owner.state.finish.release();
++	await owner.prompt;
++	expect(owner.state.returned).toBe(true);
++}
++
++async function expectFreshSuccess(f: Fixture) {
++	const saved = authority(f);
++	const owner = f.startOwner();
++	const ctx = await f.wait(owner.state.entered.promise, owner.prompt);
++	expectLiveOwner(f, owner, ctx, saved);
++	const result = await invokeOwner(f, owner, ctx);
++	expect(result.isError).toBe(false);
++	expect(result.content).toEqual([{ type: "text", text: "usable target content" }]);
++	await finishOwner(owner);
++	expect(f.effects).toEqual(["target"]);
++}
++
++const windows: Array<{ id: string; kind: ReplacementKind; window: "pending" | "stale" | "closed-born" }> = [
++	{ id: "B2-01", kind: "new", window: "pending" },
++	{ id: "B2-02", kind: "switch", window: "pending" },
++	{ id: "B2-03", kind: "fork", window: "pending" },
++	{ id: "B2-04", kind: "new", window: "stale" },
++	{ id: "B2-05", kind: "switch", window: "stale" },
++	{ id: "B2-06", kind: "fork", window: "stale" },
++	{ id: "B2-07", kind: "new", window: "closed-born" },
++	{ id: "B2-08", kind: "switch", window: "closed-born" },
++	{ id: "B2-09", kind: "fork", window: "closed-born" },
++];
++
++describe("AgentSession B2 invocation replacement", () => {
++	for (const scenario of windows) {
++		it(`should deny ${scenario.window} owner for ${scenario.kind} and admit fresh after veto [${scenario.id}]`, async () => {
++			const f = await createReplacementFixture();
++			try {
++				const saved = authority(f);
++				const earlyOwner = scenario.window === "closed-born" ? undefined : f.startOwner();
++				if (earlyOwner) await f.wait(earlyOwner.state.entered.promise, earlyOwner.prompt);
++				const transition = f.begin(scenario.kind);
++				await f.wait(f.before.entered, transition);
++				const owner = earlyOwner ?? f.startOwner();
++				const ctx = await f.wait(owner.state.entered.promise, owner.prompt);
++
++				// Checkpoint/identity/liveness precede the intended denial assertion.
++				expectBeforeEvent(f, scenario.kind);
++				expect(f.before.released).toBe(false);
++				expectLiveOwner(f, owner, ctx, saved);
++				expect(f.effects).toEqual([]);
++				if (scenario.window !== "pending") {
++					f.before.release();
++					await expect(transition).resolves.toEqual({ cancelled: true });
++					expectLiveOwner(f, owner, ctx, saved);
++				}
++				const result = await invokeOwner(f, owner, ctx);
++				expect(f.before.released).toBe(scenario.window !== "pending");
++				expectDenied(result, scenario.id);
++				expect(f.effects).toEqual([]);
++				await finishOwner(owner);
++				f.before.release();
++				await expect(transition).resolves.toEqual({ cancelled: true });
++				expectBeforeEvent(f, scenario.kind);
++				expect(f.errors).toEqual([]);
++				await expectFreshSuccess(f);
++			} finally { await f.cleanup(); }
++		});
++	}
++
++	for (const scenario of [
++		{ id: "B2-10", kind: "new" },
++		{ id: "B2-11", kind: "switch" },
++		{ id: "B2-12", kind: "fork" },
++	] satisfies Array<{ id: string; kind: ReplacementKind }>) {
++		it(`should keep ${scenario.kind} hook-error veto closed until reload [${scenario.id}]`, async () => {
++			const f = await createReplacementFixture(true);
++			try {
++				const saved = authority(f);
++				const transition = f.begin(scenario.kind);
++				await f.wait(f.before.entered, transition);
++				expectBeforeEvent(f, scenario.kind);
++				expect(f.before.released).toBe(false);
++				expect(f.errors.map(({ event, error }) => ({ event, error }))).toEqual([{
++					event: scenario.kind === "fork" ? "session_before_fork" : "session_before_switch", error: hookFailure,
++				}]);
++				f.before.release();
++				await expect(transition).resolves.toEqual({ cancelled: true });
++				const owner = f.startOwner();
++				const ctx = await f.wait(owner.state.entered.promise, owner.prompt);
++				expectLiveOwner(f, owner, ctx, saved);
++				expectDenied(await invokeOwner(f, owner, ctx), scenario.id);
++				expect(f.effects).toEqual([]);
++				await finishOwner(owner);
++				await f.own(f.session.reload());
++				expect(f.runtime.session).toBe(saved.session);
++				expect(f.session.extensionRunner).not.toBe(saved.runner);
++				expect(f.lifecycle).toEqual(["start:1:startup", "shutdown:1:reload", "loader:2", "start:2:reload"]);
++				await expectFreshSuccess(f);
++			} finally { await f.cleanup(); }
++		});
++	}
++
++	it("should admit an ordinary owner before replacement [B2-13]", async () => {
++		const f = await createReplacementFixture();
++		try {
++			await expectFreshSuccess(f);
++			expect(f.beforeEvents).toEqual([]);
++			expect(f.errors).toEqual([]);
++		} finally { await f.cleanup(); }
++	});
++});
+diff --git a/packages/coding-agent/test/suite/host-invocation-replacement-fixture.ts b/packages/coding-agent/test/suite/host-invocation-replacement-fixture.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/coding-agent/test/suite/host-invocation-replacement-fixture.ts
+@@ -0,0 +1,248 @@
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { Agent, type AgentToolResult } from "@earendil-works/pi-agent-core";
++import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
++import {
++	fauxAssistantMessage, fauxToolCall, registerFauxProvider, streamSimple,
++	type FauxProviderRegistration,
++} from "@earendil-works/pi-ai/compat";
++import { Type } from "typebox";
++import { AgentSession } from "../../src/core/agent-session.ts";
++import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
++import { createEventBus } from "../../src/core/event-bus.ts";
++import { createExtensionRuntime, loadExtensionFromFactory } from "../../src/core/extensions/loader.ts";
++import {
++	defineTool, type ExtensionFactory, type ExtensionError, type LoadExtensionsResult,
++	type SessionBeforeForkEvent, type SessionBeforeSwitchEvent,
++	type ToolExecutionContext, type ToolInvocationResult,
++} from "../../src/core/extensions/types.ts";
++import { convertToLlm } from "../../src/core/messages.ts";
++import { ModelRuntime } from "../../src/core/model-runtime.ts";
++import type { ResourceLoader } from "../../src/core/resource-loader.ts";
++import { SessionManager } from "../../src/core/session-manager.ts";
++import { SettingsManager } from "../../src/core/settings-manager.ts";
++
++export type ReplacementKind = "new" | "switch" | "fork";
++export const hookFailure = "B2 intentional before-hook failure";
++
++function deferred<T>() {
++	let resolve!: (value: T) => void;
++	const promise = new Promise<T>((fulfill) => { resolve = fulfill; });
++	return { promise, resolve };
++}
++
++function gate() {
++	const entered = deferred<void>();
++	const resume = deferred<void>();
++	let released = false;
++	return {
++		entered: entered.promise,
++		get released() { return released; },
++		release() { released = true; resume.resolve(); },
++		async wait() { entered.resolve(); await resume.promise; },
++	};
++}
++
++type Gate = ReturnType<typeof gate>;
++type OwnerState = {
++	entered: ReturnType<typeof deferred<ToolExecutionContext>>;
++	result: ReturnType<typeof deferred<ToolInvocationResult>>;
++	proceed: Gate;
++	finish: Gate;
++	attempts: number;
++	returned: boolean;
++};
++
++function textResult(text: string): AgentToolResult<undefined> {
++	return { content: [{ type: "text", text }], details: undefined };
++}
++
++/** Offline transport only; all invocation authority comes from the real registered owner. */
++export async function createReplacementFixture(failBeforeCancel = false) {
++	const cwd = mkdtempSync(join(tmpdir(), "pi-b2-replacement-"));
++	const gates: Gate[] = [];
++	const pending: Promise<unknown>[] = [];
++	const owners: OwnerState[] = [];
++	const effects: string[] = [];
++	const lifecycle: string[] = [];
++	const errors: ExtensionError[] = [];
++	const beforeEvents: Array<SessionBeforeSwitchEvent | SessionBeforeForkEvent> = [];
++	let currentFaux: FauxProviderRegistration | undefined;
++	let createdSession: AgentSession | undefined;
++	let rootId = 0;
++	let generation = 0;
++
++	function own<T>(promise: Promise<T>): Promise<T> {
++		pending.push(promise);
++		// Observe rejection immediately; retain the original disposition for assertions/cleanup.
++		void promise.catch(() => {});
++		return promise;
++	}
++	function newGate(): Gate {
++		const pause = gate();
++		gates.push(pause);
++		return pause;
++	}
++	function faux(): FauxProviderRegistration {
++		if (!currentFaux) throw new Error("B2 fixture has no current faux transport");
++		return currentFaux;
++	}
++	function installFaux() {
++		// Reload is only requested after owner prompts settle; retire before replacing the handle.
++		currentFaux?.unregister();
++		currentFaux = registerFauxProvider({
++			api: "b3b-replacement-faux", provider: "anthropic",
++			models: [{ id: "b3b-replacement", input: ["text"], reasoning: false }],
++		});
++		currentFaux.setResponses([fauxAssistantMessage("reload transport complete")]);
++		return currentFaux;
++	}
++
++	const before = newGate();
++	const factory: ExtensionFactory = (pi) => {
++		const factoryGeneration = ++generation;
++		pi.registerTool(defineTool({
++			name: "owner", label: "Owner", description: "Replacement lifecycle owner", parameters: Type.Object({}),
++			async execute(_id, _args, _signal, _update, ctx) {
++				const state = owners.shift();
++				if (!state) throw new Error("Unplanned B2 owner execution");
++				try {
++					state.entered.resolve(ctx);
++					await state.proceed.wait();
++					state.attempts++;
++					state.result.resolve(await own(ctx.invokeTool("target", {})));
++					await state.finish.wait();
++					return textResult("owner complete");
++				} finally {
++					state.returned = true;
++				}
++			},
++		}));
++		pi.registerTool(defineTool({
++			name: "target", label: "Target", description: "In-memory effect", parameters: Type.Object({}),
++			async execute() {
++				effects.push("target");
++				return textResult("usable target content");
++			},
++		}));
++		// Real typed handlers: runner must observe the first rejection, then the later veto.
++		pi.on("session_before_switch", () => { if (failBeforeCancel) throw new Error(hookFailure); });
++		pi.on("session_before_fork", () => { if (failBeforeCancel) throw new Error(hookFailure); });
++		pi.on("session_before_switch", async (event) => {
++			beforeEvents.push(event);
++			await before.wait();
++			return { cancel: true };
++		});
++		pi.on("session_before_fork", async (event) => {
++			beforeEvents.push(event);
++			await before.wait();
++			return { cancel: true };
++		});
++		pi.on("session_start", (event) => { lifecycle.push(`start:${factoryGeneration}:${event.reason}`); });
++		pi.on("session_shutdown", (event) => { lifecycle.push(`shutdown:${factoryGeneration}:${event.reason}`); });
++	};
++	async function loadExtensions(): Promise<LoadExtensionsResult> {
++		const runtime = createExtensionRuntime();
++		const extension = await loadExtensionFromFactory(factory, cwd, createEventBus(), runtime, "<inline:b2>");
++		return { extensions: [extension], errors: [], runtime };
++	}
++	async function settle(): Promise<unknown[]> {
++		for (const pause of gates) pause.release();
++		await Promise.allSettled(pending);
++		// Settling a prompt/reload can register its nested invocation/loader promise.
++		const results = await Promise.allSettled(pending);
++		return results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
++	}
++	function retire() {
++		try { createdSession?.dispose(); }
++		finally {
++			try { currentFaux?.unregister(); }
++			finally { rmSync(cwd, { recursive: true }); }
++		}
++	}
++
++	try {
++		const credentials = new InMemoryCredentialStore();
++		await credentials.modify("anthropic", async () => ({ type: "api_key", key: "b2-faux-key" }));
++		const modelRuntime = await ModelRuntime.create({
++			credentials, modelsPath: null, allowModelNetwork: false, refreshOnCreate: false,
++		});
++		const model = installFaux().getModel();
++		const sessionManager = SessionManager.inMemory(cwd);
++		const settingsManager = SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });
++		const agent = new Agent({
++			getApiKey: () => "b2-faux-key", streamFn: streamSimple, convertToLlm,
++			initialState: { model, tools: [], systemPrompt: "" },
++		});
++		let extensionsResult = await loadExtensions();
++		const resourceLoader: ResourceLoader = {
++			getExtensions: () => extensionsResult,
++			getSkills: () => ({ skills: [], diagnostics: [] }),
++			getPrompts: () => ({ prompts: [], diagnostics: [] }),
++			getThemes: () => ({ themes: [], diagnostics: [] }),
++			getAgentsFiles: () => ({ agentsFiles: [] }),
++			getSystemPrompt: () => "", getSystemPromptSource: () => undefined,
++			getAppendSystemPrompt: () => [], getAppendSystemPromptSources: () => [],
++			extendResources: () => {},
++			reload: () => own((async () => {
++				installFaux();
++				extensionsResult = await loadExtensions();
++				lifecycle.push(`loader:${generation}`);
++			})()),
++		};
++		const session: AgentSession = new AgentSession({
++			agent, sessionManager, settingsManager, cwd, modelRuntime, resourceLoader, baseToolsOverride: {},
++			toolInvocationPolicy: (request) => {
++				const registrations = session.extensionRunner.getAllRegisteredTools();
++				return request.caller === registrations.find((tool) => tool.definition.name === "owner") &&
++					request.target === registrations.find((tool) => tool.definition.name === "target") &&
++					request.sessionId === session.sessionId && request.cwd === cwd;
++			},
++		});
++		createdSession = session;
++		await session.bindExtensions({ onError: (error) => { errors.push(error); } });
++		const runtime = new AgentSessionRuntime(session, {
++			cwd, agentDir: cwd, modelRuntime, settingsManager, resourceLoader, diagnostics: [],
++		}, async () => { throw new Error("B2 replacement factory must not be called"); });
++		return {
++			session, runtime, cwd, before, beforeEvents, effects, lifecycle, errors, own,
++			begin(kind: ReplacementKind) {
++				if (kind === "new") return own(runtime.newSession());
++				if (kind === "switch") return own(runtime.switchSession(join(cwd, "missing-session.jsonl")));
++				return own(runtime.fork("b2-missing-entry", { position: "at" }));
++			},
++			startOwner() {
++				const state: OwnerState = {
++					entered: deferred<ToolExecutionContext>(), result: deferred<ToolInvocationResult>(),
++					proceed: newGate(), finish: newGate(), attempts: 0, returned: false,
++				};
++				owners.push(state);
++				faux().setResponses([
++					fauxAssistantMessage(fauxToolCall("owner", {}, { id: `b2-root-${++rootId}` }), { stopReason: "toolUse" }),
++					fauxAssistantMessage("owner transport complete"),
++				]);
++				return { state, prompt: own(session.prompt("Exercise replacement owner", { expandPromptTemplates: false })) };
++			},
++			wait<T>(notification: Promise<T>, operation: Promise<unknown>): Promise<T> {
++				return Promise.race([notification, operation.then(() => {
++					throw new Error("B2 operation settled before its expected checkpoint");
++				})]);
++			},
++			async cleanup() {
++				const failures = await settle();
++				try {
++					await session.waitForIdle();
++					failures.push(...errors.filter((error, index) => !failBeforeCancel || index > 0 ||
++						error.error !== hookFailure ||
++						(error.event !== "session_before_switch" && error.event !== "session_before_fork")));
++					if (failures.length) throw new AggregateError(failures, "Unexpected B2 fixture failure");
++				} finally { retire(); }
++			},
++		};
++	} catch (error) {
++		const failures = await settle();
++		retire();
++		throw new AggregateError([error, ...failures], "B2 fixture setup failed");
++	}
++}
