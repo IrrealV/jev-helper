@@ -1,0 +1,452 @@
+diff --git a/packages/agent/src/index.ts b/packages/agent/src/index.ts
+--- a/packages/agent/src/index.ts
++++ b/packages/agent/src/index.ts
+@@ -150,12 +150,17 @@
+ export * from "./search/index.ts";
+ export { setDefaultStreamFn } from "./stream-fn.ts";
+ export {
++	type AfterToolInvocationContext,
++	type BeforeToolInvocationContext,
+ 	type ExecutedToolCallOutcome,
+ 	executePreparedToolCall,
+ 	type FinalizedToolCallOutcome,
+ 	finalizeExecutedToolCall,
++	finalizeToolInvocation,
+ 	type ImmediateToolCallOutcome,
+ 	type PreparedToolCall,
+ 	prepareToolCall,
++	prepareToolInvocation,
++	type ToolInvocationHooks,
+ } from "./tool-execution.ts";
+ export * from "./types.ts";
+diff --git a/packages/agent/src/tool-execution.ts b/packages/agent/src/tool-execution.ts
+--- a/packages/agent/src/tool-execution.ts
++++ b/packages/agent/src/tool-execution.ts
+@@ -1,6 +1,42 @@
+ import { type AssistantMessage, validateToolArguments } from "@earendil-works/pi-ai";
+ import type { AgentEventSink } from "./agent-loop.ts";
+-import type { AgentContext, AgentLoopConfig, AgentTool, AgentToolCall, AgentToolResult } from "./types.ts";
++import type {
++	AfterToolCallContext,
++	AfterToolCallResult,
++	AgentContext,
++	AgentLoopConfig,
++	AgentTool,
++	AgentToolCall,
++	AgentToolResult,
++	BeforeToolCallContext,
++	BeforeToolCallResult,
++} from "./types.ts";
++
++/** Tool preparation context without an assumed assistant origin. */
++export type BeforeToolInvocationContext = Omit<BeforeToolCallContext, "assistantMessage">;
++
++/** Executed result context without an assumed assistant origin. */
++export type AfterToolInvocationContext = Omit<AfterToolCallContext, "assistantMessage">;
++
++export type ToolInvocationHooks = {
++	beforeToolCall?: (context: BeforeToolInvocationContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
++	afterToolCall?: (context: AfterToolInvocationContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
++};
++
++function assistantToolHooks(assistantMessage: AssistantMessage, config: AgentLoopConfig): ToolInvocationHooks {
++	return {
++		// Forward each presence/invocation read separately, after argument preparation.
++		// Keep the config receiver and the real assistant's identity at the adapter boundary.
++		get beforeToolCall(): ToolInvocationHooks["beforeToolCall"] {
++			const hook = config.beforeToolCall;
++			return hook ? (context, signal) => hook.call(config, { assistantMessage, ...context }, signal) : undefined;
++		},
++		get afterToolCall(): ToolInvocationHooks["afterToolCall"] {
++			const hook = config.afterToolCall;
++			return hook ? (context, signal) => hook.call(config, { assistantMessage, ...context }, signal) : undefined;
++		},
++	};
++}
+ 
+ export type PreparedToolCall = {
+ 	kind: "prepared";
+@@ -41,11 +77,22 @@
+ }
+ 
+ /** Prepare and validate an assistant-origin call, then run its before hook. */
+-export async function prepareToolCall(
++export function prepareToolCall(
+ 	currentContext: AgentContext,
+ 	assistantMessage: AssistantMessage,
+ 	toolCall: AgentToolCall,
+ 	config: AgentLoopConfig,
++	signal: AbortSignal | undefined,
++): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
++	// Return the phase promise directly; do not add an async adoption step.
++	return prepareToolInvocation(currentContext, toolCall, assistantToolHooks(assistantMessage, config), signal);
++}
++
++/** Prepare and validate a call, then run its origin-neutral before hook. */
++export async function prepareToolInvocation(
++	currentContext: AgentContext,
++	toolCall: AgentToolCall,
++	config: ToolInvocationHooks,
+ 	signal: AbortSignal | undefined,
+ ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
+ 	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
+@@ -63,7 +110,6 @@
+ 		if (config.beforeToolCall) {
+ 			const beforeResult = await config.beforeToolCall(
+ 				{
+-					assistantMessage,
+ 					toolCall,
+ 					args: validatedArgs,
+ 					context: currentContext,
+@@ -155,8 +201,8 @@
+ 	}
+ }
+ 
+-/** Apply the after hook without emitting completion or transcript messages. */
+-export async function finalizeExecutedToolCall(
++/** Apply the assistant-origin after hook without completion or transcript messages. */
++export function finalizeExecutedToolCall(
+ 	currentContext: AgentContext,
+ 	assistantMessage: AssistantMessage,
+ 	prepared: PreparedToolCall,
+@@ -164,6 +210,17 @@
+ 	config: AgentLoopConfig,
+ 	signal: AbortSignal | undefined,
+ ): Promise<FinalizedToolCallOutcome> {
++	return finalizeToolInvocation(currentContext, prepared, executed, assistantToolHooks(assistantMessage, config), signal);
++}
++
++/** Apply the origin-neutral after hook without completion or transcript messages. */
++export async function finalizeToolInvocation(
++	currentContext: AgentContext,
++	prepared: PreparedToolCall,
++	executed: ExecutedToolCallOutcome,
++	config: ToolInvocationHooks,
++	signal: AbortSignal | undefined,
++): Promise<FinalizedToolCallOutcome> {
+ 	let result = executed.result;
+ 	let isError = executed.isError;
+ 
+@@ -171,7 +228,6 @@
+ 		try {
+ 			const afterResult = await config.afterToolCall(
+ 				{
+-					assistantMessage,
+ 					toolCall: prepared.toolCall,
+ 					args: prepared.args,
+ 					result,
+diff --git a/packages/agent/test/tool-execution.test.ts b/packages/agent/test/tool-execution.test.ts
+--- a/packages/agent/test/tool-execution.test.ts
++++ b/packages/agent/test/tool-execution.test.ts
+@@ -14,9 +14,12 @@
+ 	executePreparedToolCall,
+ 	type FinalizedToolCallOutcome,
+ 	finalizeExecutedToolCall,
++	finalizeToolInvocation,
+ 	type ImmediateToolCallOutcome,
+ 	type PreparedToolCall,
+ 	prepareToolCall,
++	prepareToolInvocation,
++	type ToolInvocationHooks,
+ } from "../src/index.ts";
+ import type {
+ 	AgentContext,
+@@ -569,3 +572,137 @@
+ 		expect(finalized.result).toEqual({ ...original, usage: usage(11), terminate: false });
+ 	});
+ });
++
++// Added after the real neutral exports exist: GREEN-to-GREEN parity, not behavioral RED.
++describe("origin-neutral tool phases", () => {
++	it("should prepare, execute and finalize without an assistant or transcript mutation", async () => {
++		const raw = call();
++		raw.arguments = { legacy: "raw" };
++		const signal = new AbortController().signal;
++		const events: AgentEvent[] = [];
++		const original = result();
++		let validated: unknown;
++		const context: AgentContext = { messages: [], tools: [tool({
++			prepareArguments: (args) => {
++				expect(args).toBe(raw.arguments);
++				return { value: "prepared" };
++			},
++			execute: async (id, args, receivedSignal, update) => {
++				expect(id).toBe(raw.id);
++				expect(args).toBe(validated);
++				expect(args.value).toBe("mutated");
++				expect(receivedSignal).toBe(signal);
++				update?.(result("progress"));
++				return original;
++			},
++		})] };
++		const hooks: ToolInvocationHooks = {
++			beforeToolCall: async (input, receivedSignal) => {
++				expect(input).not.toHaveProperty("assistantMessage");
++				expect(input.context).toBe(context);
++				expect(input.toolCall).toBe(raw);
++				expect(receivedSignal).toBe(signal);
++				expect(input.args).toEqual({ value: "prepared" });
++				validated = input.args;
++				(input.args as { value: string }).value = "mutated";
++				return undefined;
++			},
++			afterToolCall: async (input, receivedSignal) => {
++				expect(input).not.toHaveProperty("assistantMessage");
++				expect(input.context).toBe(context);
++				expect(input.toolCall).toBe(raw);
++				expect(input.args).toBe(validated);
++				expect(input.result).toBe(original);
++				expect(input.isError).toBe(false);
++				expect(receivedSignal).toBe(signal);
++				return { usage: usage(8), terminate: true };
++			},
++		};
++
++		const prepared = await prepareToolInvocation(context, raw, hooks, signal);
++		if (prepared.kind !== "prepared") throw new Error("Expected prepared call");
++		const executed = await executePreparedToolCall(prepared, signal, (event) => { events.push(event); });
++		const finalized = await finalizeToolInvocation(context, prepared, executed, hooks, signal);
++
++		expect(finalized).toEqual({ toolCall: raw, result: { ...original, usage: usage(8), terminate: true }, isError: false });
++		expect(original.usage).toEqual(usage());
++		expect(raw.arguments).toEqual({ legacy: "raw" });
++		expect(context.messages).toEqual([]);
++		expect(events).toEqual([{
++			type: "tool_execution_update", toolCallId: raw.id, toolName: raw.name,
++			args: raw.arguments, partialResult: result("progress"),
++		}]);
++	});
++
++	it.each(["missing", "invalid", "prepare-error", "before-error", "deny", "abort", "abort-deny"] as const)(
++		"should preserve neutral preparation short-circuits (%s)", async (mode) => {
++			const visits: string[] = [];
++			const controller = new AbortController();
++			const context: AgentContext = { messages: [], tools: mode === "missing" ? [] : [tool({
++				prepareArguments: () => {
++					visits.push("prepare");
++					if (mode === "prepare-error") throw new Error("prepare failed");
++					return { value: mode === "invalid" ? "" : "prepared" };
++				},
++				execute: async () => { throw new Error("Must not execute"); },
++			})] };
++			const hooks: ToolInvocationHooks = {
++				beforeToolCall: async (input) => {
++					visits.push("before");
++					expect(input).not.toHaveProperty("assistantMessage");
++					expect(input.args).toEqual({ value: "prepared" });
++					if (mode === "before-error") throw "before failed";
++					if (mode === "abort-deny") controller.abort();
++					return { block: true, reason: "denied", terminate: true };
++				},
++			};
++			if (mode === "abort") controller.abort();
++
++			const prepared = await prepareToolInvocation(context, call(), hooks, controller.signal);
++
++			expect(visits).toEqual(mode === "missing" ? [] : mode === "invalid" || mode === "prepare-error"
++				? ["prepare"] : ["prepare", "before"]);
++			const text = mode === "missing" ? "Tool echo not found" : mode === "invalid" ? expect.stringContaining("value")
++				: mode === "prepare-error" ? "prepare failed" : mode === "before-error" ? "before failed"
++				: mode === "deny" ? "denied" : "Operation aborted";
++			expect(prepared).toEqual({
++				kind: "immediate", isError: true,
++				result: { content: [{ type: "text", text }], details: {}, ...(mode === "deny" ? { terminate: true } : {}) },
++			});
++			expect(context.messages).toEqual([]);
++		},
++	);
++
++	it.each(["plain", "override", "recover", "execute-error", "after-error"] as const)(
++		"should preserve neutral finalization errors and usage merging (%s)", async (mode) => {
++			const original = { ...result(), terminate: true };
++			const raw = call();
++			const context: AgentContext = { messages: [], tools: [tool({ execute: async () => {
++				if (mode === "recover" || mode === "execute-error") throw new Error("execute failed");
++				return original;
++			} })] };
++			const prepared = await prepareToolInvocation(context, raw, {}, undefined);
++			if (prepared.kind !== "prepared") throw new Error("Expected prepared call");
++			const executed = await executePreparedToolCall(prepared, undefined, () => {});
++			const hooks: ToolInvocationHooks = mode === "plain" ? {} : { afterToolCall: async (input) => {
++				expect(input).not.toHaveProperty("assistantMessage");
++				expect(input.result).toBe(executed.result);
++				expect(input.args).toBe(prepared.args);
++				expect(input.isError).toBe(mode === "recover" || mode === "execute-error");
++				if (mode === "after-error") throw new Error("after failed");
++				if (mode === "recover") return { content: [], details: { replacement: true }, usage: usage(9), isError: false, terminate: false };
++				return mode === "override" ? { usage: usage(8), isError: true, terminate: false } : undefined;
++			} };
++
++			const finalized = await finalizeToolInvocation(context, prepared, executed, hooks, undefined);
++
++			const expected = mode === "recover" ? { content: [], details: { replacement: true }, usage: usage(9), terminate: false }
++				: mode === "after-error" || mode === "execute-error" ? { content: [{ type: "text", text: mode === "after-error" ? "after failed" : "execute failed" }], details: {} }
++				: mode === "override" ? { ...original, usage: usage(8), terminate: false } : original;
++			expect(finalized).toEqual({ toolCall: raw, result: expected, isError: mode !== "plain" && mode !== "recover" });
++			if (mode === "plain" || mode === "execute-error") expect(finalized.result).toBe(executed.result);
++			expect(original).toEqual({ ...result(), terminate: true });
++			expect(context.messages).toEqual([]);
++		},
++	);
++});
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -16,12 +16,16 @@
+ import { readFileSync } from "node:fs";
+ import { basename, dirname } from "node:path";
+ import type {
++	AfterToolCallResult,
+ 	Agent,
+ 	AgentContext,
+ 	AgentEvent,
+ 	AgentMessage,
+ 	AgentState,
+ 	AgentTool,
++	AgentToolCall,
++	AgentToolResult,
++	BeforeToolCallResult,
+ 	PrepareNextTurnContext,
+ 	ThinkingLevel,
+ } from "@earendil-works/pi-agent-core";
+@@ -527,60 +531,78 @@
+ 	 * happens here instead of in wrappers.
+ 	 */
+ 	private _installAgentToolHooks(): void {
+-		this.agent.beforeToolCall = async ({ toolCall, args }) => {
++		this.agent.beforeToolCall = ({ toolCall, args }) => {
+ 			const runner = this._extensionRunner;
+-			if (!runner.hasHandlers("tool_call")) {
+-				return undefined;
+-			}
+-
+-			try {
+-				return await runner.emitToolCall({
+-					type: "tool_call",
++			return this._beforeToolCall(runner, toolCall, args);
++		};
++
++		this.agent.afterToolCall = ({ toolCall, args, result, isError }) => {
++			const runner = this._extensionRunner;
++			return this._afterToolCall(runner, toolCall, args, result, isError);
++		};
++	}
++
++	private async _beforeToolCall(
++		runner: ExtensionRunner,
++		toolCall: AgentToolCall,
++		args: unknown,
++	): Promise<BeforeToolCallResult | undefined> {
++		if (!runner.hasHandlers("tool_call")) {
++			return undefined;
++		}
++
++		try {
++			return await runner.emitToolCall({
++				type: "tool_call",
++				toolName: toolCall.name,
++				toolCallId: toolCall.id,
++				input: args as Record<string, unknown>,
++			});
++		} catch (err) {
++			if (err instanceof Error) {
++				throw err;
++			}
++			throw new Error(`Extension failed, blocking execution: ${String(err)}`);
++		}
++	}
++
++	private async _afterToolCall(
++		runner: ExtensionRunner,
++		toolCall: AgentToolCall,
++		args: unknown,
++		result: AgentToolResult<unknown>,
++		isError: boolean,
++	): Promise<AfterToolCallResult | undefined> {
++		const hookResult = runner.hasHandlers("tool_result")
++			? await runner.emitToolResult({
++					type: "tool_result",
+ 					toolName: toolCall.name,
+ 					toolCallId: toolCall.id,
+ 					input: args as Record<string, unknown>,
+-				});
+-			} catch (err) {
+-				if (err instanceof Error) {
+-					throw err;
+-				}
+-				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
+-			}
+-		};
+-
+-		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+-			const runner = this._extensionRunner;
+-			const hookResult = runner.hasHandlers("tool_result")
+-				? await runner.emitToolResult({
+-						type: "tool_result",
+-						toolName: toolCall.name,
+-						toolCallId: toolCall.id,
+-						input: args as Record<string, unknown>,
+-						content: result.content,
+-						details: result.details,
+-						isError,
+-						usage: result.usage,
+-					})
+-				: undefined;
+-
+-			const content = hookResult?.content ?? result.content ?? [];
+-			// Runs after the extension hook so images injected or replaced by extensions are normalized too.
+-			const resizeOptions = this.model?.inputLimits?.images?.resize;
+-			const normalizedContent = await normalizeToolResultImages(content, {
+-				autoResizeImages: this.settingsManager.getImageAutoResize(),
+-				...(resizeOptions ? { resizeOptions } : {}),
+-			});
+-
+-			if (!hookResult && normalizedContent === content) {
+-				return undefined;
+-			}
+-
+-			return {
+-				content: normalizedContent,
+-				details: hookResult?.details,
+-				isError: hookResult?.isError ?? isError,
+-				usage: hookResult?.usage,
+-			};
++					content: result.content,
++					details: result.details,
++					isError,
++					usage: result.usage,
++				})
++			: undefined;
++
++		const content = hookResult?.content ?? result.content ?? [];
++		// Runs after the extension hook so images injected or replaced by extensions are normalized too.
++		const resizeOptions = this.model?.inputLimits?.images?.resize;
++		const normalizedContent = await normalizeToolResultImages(content, {
++			autoResizeImages: this.settingsManager.getImageAutoResize(),
++			...(resizeOptions ? { resizeOptions } : {}),
++		});
++
++		if (!hookResult && normalizedContent === content) {
++			return undefined;
++		}
++
++		return {
++			content: normalizedContent,
++			details: hookResult?.details,
++			isError: hookResult?.isError ?? isError,
++			usage: hookResult?.usage,
+ 		};
+ 	}
+ 
+diff --git a/packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts b/packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts
+--- a/packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts
++++ b/packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts
+@@ -39,7 +39,7 @@
+ 				});
+ 				pi.on("tool_result", (event) => {
+ 					visits.push("after");
+-					results.push(event);
++					results.push(structuredClone(event));
+ 					if (mode === "result-error") throw new Error("result handler failed");
+ 					return { content: [{ type: "text", text: "intercepted" }], details: { replacement: true }, isError: true };
+ 				});
