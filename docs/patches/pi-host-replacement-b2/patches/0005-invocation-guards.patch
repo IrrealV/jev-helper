@@ -1,0 +1,446 @@
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -262,8 +262,13 @@
+ 
+ interface ToolExecutionFrame {
+ 	caller: RegisteredTool;
++	callerName: string;
+ 	definition: ToolDefinition;
+ 	execute: ToolDefinition["execute"];
++	tool: AgentTool | undefined;
++	toolExecute: AgentTool["execute"] | undefined;
++	depth: 0 | 1;
++	attempted: boolean;
+ 	runner: ExtensionRunner;
+ 	sessionId: string;
+ 	cwd: string;
+@@ -689,8 +694,16 @@
+ 		signal: AbortSignal | undefined,
+ 		context: ExtensionContext,
+ 	): ToolExecutionBinding {
++		const definition = caller.definition;
++		const execute = definition.execute;
++		const pending = this._toolInvocationExecutions.get(parentToolCallId);
++		const record = pending?.registration === caller && pending.definition === definition &&
++			pending.execute === execute ? pending.record : undefined;
++		const tool = this._registeredToolWrappers.get(definition.name)?.tool;
+ 		const frame: ToolExecutionFrame = {
+-			caller, definition: caller.definition, execute: caller.definition.execute,
++			caller, callerName: definition.name, definition, execute, tool, toolExecute: tool?.execute,
++			// Only an owner-matched pending execution is nested; names alone grant no authority.
++			depth: record ? 1 : 0, attempted: false,
+ 			runner, parentToolCallId, signal, sessionId: this.sessionId, cwd: this._cwd, live: true,
+ 		};
+ 		// Preserve the runner's lazy/stale-context getters; signal belongs to this execution.
+@@ -699,9 +712,6 @@
+ 			signal: { get: () => signal },
+ 			invokeTool: { value: (name: string, args: Record<string, unknown>) => this._invokeTool(frame, name, args) },
+ 		}) as ToolExecutionContext;
+-		const pending = this._toolInvocationExecutions.get(parentToolCallId);
+-		const record = pending?.registration === caller && pending.definition === frame.definition &&
+-			pending.execute === frame.execute ? pending.record : undefined;
+ 		return {
+ 			context: executionContext,
+ 			run: async (execute) => {
+@@ -731,22 +741,49 @@
+ 		const denied = (reason: string): ToolInvocationResult => ({
+ 			content: [{ type: "text", text: reason }], details: undefined, isError: true, invocationId,
+ 		});
++		// Consume synchronously, including denied policy/invalid target/capacity attempts.
++		const alreadyAttempted = frame.attempted;
++		if (frame.live && frame.depth === 0) frame.attempted = true;
+ 		// Retain every admitted record. Capacity is checked before policy, hooks or target effects.
+ 		if (this._toolInvocationRecords.length >= 128) return denied("Tool invocation ledger is full");
+ 		const record: ToolInvocationRecord = {
+ 			invocationId, sessionId: frame.sessionId, cwd: frame.cwd, parentToolCallId: frame.parentToolCallId,
+-			callerName: frame.definition.name, targetName: name, status: "denied", execution: "not-entered",
++			callerName: frame.callerName, targetName: name, status: "denied", execution: "not-entered",
+ 			isError: true, rawUsage: { state: "not-entered" }, finalUsage: { state: "not-entered" },
+ 		};
+ 		this._toolInvocationRecords.push(record);
+ 		if (!frame.live) return denied("Parent tool execution has completed");
+-		const caller = this._registeredToolWrappers.get(frame.definition.name);
++		if (frame.depth !== 0) return denied("Nested tool invocation depth exceeded");
++		if (alreadyAttempted) return denied("Parent tool invocation attempt already consumed");
++		const caller = this._registeredToolWrappers.get(frame.callerName);
+ 		const target = this._registeredToolWrappers.get(name);
+-		const active = this.agent.state.tools;
+-		if (!caller || caller.registration !== frame.caller || !active.includes(caller.tool) ||
+-			!target || !active.includes(target.tool)) return denied("Tool invocation requires active registered tools");
++		if (!caller || !target) return denied("Tool invocation requires active registered tools");
+ 		const definition = target.registration.definition;
+ 		const execute = definition.execute;
++		const toolExecute = target.tool.execute;
++		const isCurrent = (): boolean => {
++			// registerTool -> runtime.refreshTools -> _refreshToolRegistry replaces these owner bindings.
++			// Compare the captured bindings, never resolve a new executable and retry it.
++			const active = this.agent.state.tools;
++			return frame.live && !frame.signal?.aborted && this.sessionId === frame.sessionId &&
++				this._cwd === frame.cwd && this._extensionRunner === frame.runner &&
++				this._registeredToolWrappers.get(frame.callerName) === caller &&
++				caller.registration === frame.caller && caller.registration.definition === frame.definition &&
++				frame.definition.name === frame.callerName && frame.definition.execute === frame.execute &&
++				caller.tool === frame.tool && caller.tool.execute === frame.toolExecute && active.includes(caller.tool) &&
++				this._registeredToolWrappers.get(name) === target && target.registration.definition === definition &&
++				definition.name === name && definition.execute === execute && target.tool.execute === toolExecute &&
++				active.includes(target.tool);
++		};
++		const denyStale = (): ToolInvocationResult => {
++			record.status = "denied";
++			record.isError = true;
++			// A late denial cannot undo execution or discard already observed raw/effective usage.
++			if (record.execution === "not-entered") record.finalUsage = { state: "not-entered" };
++			else if (record.finalUsage.state === "pending") record.finalUsage = { state: "unknown" };
++			return denied("Tool invocation capture is stale");
++		};
++		if (!isCurrent()) return denyStale();
+ 		let admitted = false;
+ 		try {
+ 			admitted = await this._toolInvocationPolicy?.({
+@@ -756,6 +793,7 @@
+ 		} catch {
+ 			// A policy failure is a denial, not permission to fall through.
+ 		}
++		if (!isCurrent()) return denyStale();
+ 		if (!admitted) return denied("Tool invocation denied by host policy");
+ 
+ 		record.status = "pending";
+@@ -775,17 +813,22 @@
+ 		this._toolInvocationExecutions.set(invocationId, { registration: target.registration, definition, execute, record });
+ 		try {
+ 			const prepared = await prepareToolInvocation(context, toolCall, hooks, frame.signal);
+-			const outcome = prepared.kind === "immediate" ? prepared : await finalizeToolInvocation(
+-				context, prepared,
+-				await executePreparedToolCall(prepared, frame.signal, async (event) => {
++			if (!isCurrent()) return denyStale();
++			let outcome: { result: AgentToolResult<unknown>; isError: boolean };
++			if (prepared.kind === "immediate") {
++				outcome = prepared;
++			} else {
++				const executed = await executePreparedToolCall(prepared, frame.signal, async (event) => {
+ 					if (event.type === "tool_execution_update") await frame.runner.emit(event);
+-				}),
+-				hooks, frame.signal,
+-			);
++				});
++				if (!isCurrent()) return denyStale();
++				outcome = await finalizeToolInvocation(context, prepared, executed, hooks, frame.signal);
++			}
++			record.finalUsage = record.execution === "not-entered"
++				? { state: "not-entered" } : observeInvocationUsage(outcome.result.usage);
++			if (!isCurrent()) return denyStale();
+ 			record.status = "completed";
+ 			record.isError = outcome.isError;
+-			record.finalUsage = record.execution === "not-entered"
+-				? { state: "not-entered" } : observeInvocationUsage(outcome.result.usage);
+ 			// Never forward usage: an ordinary parent may return this result to the main loop.
+ 			return {
+ 				content: outcome.result.content, details: outcome.result.details,
+diff --git a/packages/coding-agent/test/suite/agent-session-tool-invocation-guards.test.ts b/packages/coding-agent/test/suite/agent-session-tool-invocation-guards.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/coding-agent/test/suite/agent-session-tool-invocation-guards.test.ts
+@@ -0,0 +1,302 @@
++import { fauxAssistantMessage, fauxToolCall, type Usage } from "@earendil-works/pi-ai/compat";
++import { Type } from "typebox";
++import { describe, expect, it } from "vitest";
++import {
++	defineTool,
++	type ExtensionAPI,
++	type ToolExecutionContext,
++	type ToolInvocationPolicy,
++	type ToolInvocationResult,
++} from "../../src/index.ts";
++import { createHarness, type Harness } from "./harness.ts";
++
++function deferred<T>() {
++	let resolve!: (value: T) => void;
++	const promise = new Promise<T>((fulfill) => { resolve = fulfill; });
++	return { promise, resolve };
++}
++
++const rawUsage: Usage = {
++	input: 3, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 5,
++	cost: { input: 0.25, output: 0.25, cacheRead: 0, cacheWrite: 0, total: 0.5 },
++};
++const finalUsage: Usage = {
++	input: 7, output: 11, cacheRead: 0, cacheWrite: 0, totalTokens: 18,
++	cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 },
++};
++const textResult = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
++type Invoke = (context: ToolExecutionContext, name?: string) => Promise<ToolInvocationResult>;
++
++async function fixture(options: {
++	parent?: (context: ToolExecutionContext, invoke: Invoke) => Promise<void>;
++	target?: (context: ToolExecutionContext, invoke: Invoke) => Promise<void>;
++	policy?: ToolInvocationPolicy;
++	hooks?: (pi: ExtensionAPI) => void;
++} = {}) {
++	const effects: string[] = [];
++	const policies: string[] = [];
++	const results: ToolInvocationResult[] = [];
++	const pending: Promise<ToolInvocationResult>[] = [];
++	const invoke: Invoke = (ctx, name = "target") => {
++		const promise = ctx.invokeTool(name, {}).then((result) => { results.push(result); return result; });
++		pending.push(promise);
++		return promise;
++	};
++	const parent = defineTool({
++		name: "parent", label: "Parent", description: "Inline root", parameters: Type.Object({}),
++		async execute(_id, _args, _signal, _update, ctx) {
++			if (options.parent) await options.parent(ctx, invoke);
++			else await invoke(ctx);
++			return textResult("parent finished");
++		},
++	});
++	const target = defineTool({
++		name: "target", label: "Target", description: "Inline child", parameters: Type.Object({}),
++		async execute(_id, _args, _signal, _update, ctx) {
++			effects.push("target");
++			await options.target?.(ctx, invoke);
++			return { ...textResult("usable target content"), usage: rawUsage };
++		},
++	});
++	const grandchild = defineTool({
++		name: "grandchild", label: "Grandchild", description: "Inline grandchild", parameters: Type.Object({}),
++		async execute() { effects.push("grandchild"); return textResult("grandchild"); },
++	});
++	let api!: ExtensionAPI;
++	const harness = await createHarness({
++		tools: [], settings: { retry: { enabled: false }, compaction: { enabled: false } },
++		toolInvocationPolicy: (request) => {
++			policies.push(request.target.definition.name);
++			return options.policy ? options.policy(request) : true;
++		},
++		extensionFactories: [(pi) => {
++			api = pi;
++			pi.registerTool(parent);
++			pi.registerTool(target);
++			pi.registerTool(grandchild);
++			options.hooks?.(pi);
++		}],
++	});
++	await harness.session.bindExtensions({});
++	return { harness, api, parent, target, effects, policies, results, pending };
++}
++
++function start(harness: Harness): Promise<void> {
++	harness.setResponses([
++		fauxAssistantMessage(fauxToolCall("parent", {}, { id: "root" }), { stopReason: "toolUse" }),
++		fauxAssistantMessage("finished"),
++	]);
++	return harness.session.prompt("Exercise A1 guards", { expandPromptTemplates: false });
++}
++
++async function entered(gate: Promise<void>, prompt: Promise<void>) {
++	await Promise.race([gate, prompt.then(() => { throw new Error("Parent finished before the expected gate"); })]);
++}
++
++async function settle(f: Awaited<ReturnType<typeof fixture>>, prompt: Promise<void>) {
++	// Every test releases its gates first, even after a RED assertion. No leaked work reaches cleanup.
++	await Promise.allSettled([prompt]);
++	await Promise.allSettled(f.pending);
++	await f.harness.session.waitForIdle();
++	f.harness.cleanup();
++}
++
++function expectDenied(result: ToolInvocationResult) {
++	expect(result.isError).toBe(true);
++	expect(result.content).not.toEqual([{ type: "text", text: "usable target content" }]);
++	expect("usage" in result).toBe(false);
++}
++
++function expectOneContribution(harness: Harness, usage: Usage) {
++	const model = { input: 0, output: 0, cost: 0 };
++	for (const message of harness.session.messages) {
++		if (message.role !== "assistant") continue;
++		model.input += message.usage.input;
++		model.output += message.usage.output;
++		model.cost += message.usage.cost.total;
++	}
++	const stats = harness.session.getSessionStats();
++	expect(stats.tokens.input).toBe(model.input + usage.input);
++	expect(stats.tokens.output).toBe(model.output + usage.output);
++	expect(stats.cost).toBe(model.cost + usage.cost.total);
++	expect(stats.toolInvocations.known).toBe(1);
++	expect(stats.toolInvocations.pending).toBe(0);
++	expect(stats.toolInvocations.notEntered).toBe(0);
++}
++
++describe("AgentSession A1 invocation guards", () => {
++	it("should consume one attempt before concurrent policy admission [A1-01]", async () => {
++		const gate = deferred<void>();
++		const release = deferred<void>();
++		const f = await fixture({
++			parent: async (ctx, invoke) => { await Promise.all([invoke(ctx), invoke(ctx)]); },
++			hooks: (pi) => pi.on("tool_call", async (event) => {
++				if (event.toolName !== "target") return;
++				gate.resolve();
++				await release.promise;
++			}),
++		});
++		const prompt = start(f.harness);
++		try {
++			await entered(gate.promise, prompt);
++			// Do not await either request before releasing the shared baseline gate.
++			expect(f.policies).toEqual(["target"]);
++			release.resolve();
++			await prompt;
++			expect(f.effects).toEqual(["target"]);
++			expect(f.results.map((result) => result.isError).sort()).toEqual([false, true]);
++		} finally { release.resolve(); await settle(f, prompt); }
++	});
++
++	it.each(["policy denial", "invalid target"])("should consume a %s attempt without retry effects [A1-02]", async (mode) => {
++		let permissive = false;
++		const f = await fixture({
++			policy: () => permissive,
++			parent: async (ctx, invoke) => {
++				await invoke(ctx, mode === "invalid target" ? "missing" : "target");
++				permissive = true;
++				await invoke(ctx);
++			},
++		});
++		const prompt = start(f.harness);
++		try {
++			await prompt;
++			expect(f.effects).toEqual([]);
++			expect(f.policies).toEqual(mode === "invalid target" ? [] : ["target"]);
++			expect(f.results).toHaveLength(2);
++			f.results.forEach(expectDenied);
++		} finally { await settle(f, prompt); }
++	});
++
++	it("should deny a grandchild despite permissive policy [A1-03]", async () => {
++		const f = await fixture({ target: async (ctx, invoke) => { await invoke(ctx, "grandchild"); } });
++		const prompt = start(f.harness);
++		try {
++			await prompt;
++			expect(f.effects).toEqual(["target"]);
++			expect(f.policies).toEqual(["target"]);
++			expect(f.results).toHaveLength(2);
++			expectDenied(f.results[0]);
++			expect(f.results[1].isError).toBe(false);
++		} finally { await settle(f, prompt); }
++	});
++
++	it.each([
++		"target deactivation [A1-04]", "target registration replacement [A1-05]", "target executable replacement [A1-06]",
++		"caller deactivation [A1-10]", "caller registration replacement [A1-11]", "caller executable replacement [A1-12]",
++	])("should deny %s during preparation", async (mode) => {
++		const gate = deferred<void>();
++		const release = deferred<void>();
++		const f = await fixture({ hooks: (pi) => pi.on("tool_call", async (event) => {
++			if (event.toolName !== "target") return;
++			gate.resolve();
++			await release.promise;
++		}) });
++		const prompt = start(f.harness);
++		try {
++			await entered(gate.promise, prompt);
++			const definition = mode.startsWith("caller") ? f.parent : f.target;
++			const replacement = async () => { f.effects.push("substituted"); return textResult("substituted"); };
++			if (mode.includes("deactivation")) {
++				f.api.setActiveTools(f.harness.session.getActiveToolNames().filter((name) => name !== definition.name));
++			} else if (mode.includes("registration")) {
++				// Real owner refresh; no private mapping or definition-dispatch substitution.
++				f.api.registerTool({ ...definition, execute: replacement });
++			} else {
++				definition.execute = replacement;
++			}
++			release.resolve();
++			await prompt;
++			expect(f.effects).toEqual([]);
++			expect(f.results).toHaveLength(1);
++			expectDenied(f.results[0]);
++			expect(f.harness.session.getToolInvocationRecords()[0]).toMatchObject({
++				execution: "not-entered", rawUsage: { state: "not-entered" }, finalUsage: { state: "not-entered" },
++			});
++		} finally { release.resolve(); await settle(f, prompt); }
++	});
++
++	it.each(["completes [A1-07]", "aborts [A1-08]"])("should deny when parent %s during preparation", async (mode) => {
++		const gate = deferred<void>();
++		const release = deferred<void>();
++		const finishParent = deferred<void>();
++		const f = await fixture({
++			parent: async (ctx, invoke) => { void invoke(ctx); await finishParent.promise; },
++			hooks: (pi) => pi.on("tool_call", async (event) => {
++				if (event.toolName !== "target") return;
++				gate.resolve();
++				await release.promise;
++			}),
++		});
++		const prompt = start(f.harness);
++		let abort: Promise<void> | undefined;
++		try {
++			await entered(gate.promise, prompt);
++			if (mode.startsWith("aborts")) abort = f.harness.session.abort();
++			finishParent.resolve();
++			await prompt;
++			release.resolve();
++			await Promise.all(f.pending);
++			expect(f.effects).toEqual([]);
++			expectDenied(f.results[0]);
++			expect(f.harness.session.getToolInvocationRecords()[0].execution).toBe("not-entered");
++		} finally {
++			finishParent.resolve(); release.resolve();
++			await settle(f, prompt); await abort;
++		}
++	});
++
++	it.each(["execution [A1-09]", "finalization [A1-13]"])("should deny late content after %s while retaining one usage contribution", async (phase) => {
++		const gate = deferred<void>();
++		const release = deferred<void>();
++		const finishParent = deferred<void>();
++		const f = await fixture({
++			parent: async (ctx, invoke) => { void invoke(ctx); await finishParent.promise; },
++			target: async () => {
++				if (!phase.startsWith("execution")) return;
++				gate.resolve(); await release.promise;
++			},
++			hooks: (pi) => pi.on("tool_result", async (event) => {
++				if (event.toolName !== "target" || !phase.startsWith("finalization")) return;
++				gate.resolve(); await release.promise;
++				return { content: [{ type: "text", text: "usable final content" }], usage: finalUsage };
++			}),
++		});
++		const prompt = start(f.harness);
++		try {
++			await entered(gate.promise, prompt);
++			finishParent.resolve();
++			await prompt;
++			release.resolve();
++			await Promise.all(f.pending);
++			expect(f.effects).toEqual(["target"]);
++			expectDenied(f.results[0]);
++			expect(f.results[0].content).not.toEqual([{ type: "text", text: "usable final content" }]);
++			const records = f.harness.session.getToolInvocationRecords();
++			expect(records).toHaveLength(1);
++			expect(records[0]).toMatchObject({ status: "denied", execution: "entered", rawUsage: { state: "known", usage: rawUsage } });
++			if (phase.startsWith("finalization")) expect(records[0].finalUsage).toEqual({ state: "known", usage: finalUsage });
++			expectOneContribution(f.harness, phase.startsWith("execution") ? rawUsage : finalUsage);
++		} finally { finishParent.resolve(); release.resolve(); await settle(f, prompt); }
++	});
++
++	it("should recheck identities after the policy microtask yield [A1-14]", async () => {
++		const preparations: string[] = [];
++		const f = await fixture({
++			policy: (request) => {
++				queueMicrotask(() => {
++					request.target.definition.execute = async () => { f.effects.push("substituted"); return textResult("substituted"); };
++				});
++				return true;
++			},
++			hooks: (pi) => pi.on("tool_call", (event) => { if (event.toolName === "target") preparations.push("target"); }),
++		});
++		const prompt = start(f.harness);
++		try {
++			await prompt;
++			expect(preparations).toEqual([]);
++			expect(f.effects).toEqual([]);
++			expectDenied(f.results[0]);
++		} finally { await settle(f, prompt); }
++	});
++});
