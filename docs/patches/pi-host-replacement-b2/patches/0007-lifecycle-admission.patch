@@ -1,0 +1,848 @@
+diff --git a/packages/coding-agent/src/core/agent-session-runtime.ts b/packages/coding-agent/src/core/agent-session-runtime.ts
+--- a/packages/coding-agent/src/core/agent-session-runtime.ts
++++ b/packages/coding-agent/src/core/agent-session-runtime.ts
+@@ -404,6 +404,7 @@
+ 	}
+ 
+ 	async dispose(): Promise<void> {
++		this.session.closeToolInvocationsForDisposal();
+ 		await emitSessionShutdownEvent(this.session.extensionRunner, {
+ 			type: "session_shutdown",
+ 			reason: "quit",
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -274,6 +274,8 @@
+ 	toolExecute: AgentTool["execute"] | undefined;
+ 	depth: 0 | 1;
+ 	attempted: boolean;
++	invocationGeneration: bigint;
++	invocationAdmittedAtBirth: boolean;
+ 	runner: ExtensionRunner;
+ 	sessionId: string;
+ 	cwd: string;
+@@ -483,6 +485,11 @@
+ 	private _toolRegistry: Map<string, AgentTool> = new Map();
+ 	private _registeredToolWrappers = new Map<string, { registration: RegisteredTool; tool: AgentTool }>();
+ 	private readonly _toolInvocationPolicy?: ToolInvocationPolicy;
++	private _toolInvocationGeneration = 0n;
++	private _toolInvocationReadyGeneration = 0n;
++	private _toolInvocationTransitions = 0;
++	private _toolInvocationReloadFailure: bigint | undefined;
++	private _toolInvocationDisposed = false;
+ 	private readonly _toolInvocationRecords: ToolInvocationRecord[] = [];
+ 	private readonly _toolInvocationExecutions = new Map<string, {
+ 		registration: RegisteredTool;
+@@ -692,6 +699,45 @@
+ 		};
+ 	}
+ 
++	private _canAdmitToolInvocation(): boolean {
++		return !this._toolInvocationDisposed && this._toolInvocationTransitions === 0 &&
++			this._toolInvocationReloadFailure === undefined &&
++			this._toolInvocationReadyGeneration === this._toolInvocationGeneration;
++	}
++
++	private _beginToolInvocationTransition(): bigint {
++		this._toolInvocationTransitions++;
++		return ++this._toolInvocationGeneration;
++	}
++
++	private _finishToolInvocationTransition(generation: bigint, kind: "abort" | "reload", succeeded: boolean): void {
++		this._toolInvocationTransitions--;
++		if (!succeeded) {
++			// Even an older failure revokes newer captures/completions already in flight.
++			const failureGeneration = ++this._toolInvocationGeneration;
++			if (kind === "reload") this._toolInvocationReloadFailure = failureGeneration;
++			return;
++		}
++		if (kind === "reload" && this._toolInvocationReloadFailure !== undefined &&
++			generation > this._toolInvocationReloadFailure) {
++			// Only a successful reload begun after the failure can clear this latch.
++			this._toolInvocationReloadFailure = undefined;
++		}
++		if (generation === this._toolInvocationGeneration) {
++			this._toolInvocationReadyGeneration = generation;
++		}
++		// A newest successful completion can await older operations' bookkeeping,
++		// but an older success cannot grant readiness to a newer pending transition.
++		// This gates only invokeTool; it adds no waits to ordinary session operations.
++	}
++
++	/** @internal Close-only runtime disposal bridge; never grants authority or invalidates cleanup contexts. */
++	closeToolInvocationsForDisposal(): void {
++		if (this._toolInvocationDisposed) return;
++		this._toolInvocationDisposed = true;
++		this._toolInvocationGeneration++;
++	}
++
+ 	private _bindToolExecution(
+ 		caller: RegisteredTool,
+ 		runner: ExtensionRunner,
+@@ -709,6 +755,8 @@
+ 			caller, callerName: definition.name, definition, execute, tool, toolExecute: tool?.execute,
+ 			// Only an owner-matched pending execution is nested; names alone grant no authority.
+ 			depth: record ? 1 : 0, attempted: false,
++			invocationGeneration: this._toolInvocationGeneration,
++			invocationAdmittedAtBirth: this._canAdmitToolInvocation(),
+ 			runner, parentToolCallId, signal, sessionId: this.sessionId, cwd: this._cwd, live: true,
+ 		};
+ 		// Preserve the runner's lazy/stale-context getters; signal belongs to this execution.
+@@ -772,7 +820,9 @@
+ 			// registerTool -> runtime.refreshTools -> _refreshToolRegistry replaces these owner bindings.
+ 			// Compare the captured bindings, never resolve a new executable and retry it.
+ 			const active = this.agent.state.tools;
+-			return frame.live && !frame.signal?.aborted && this.sessionId === frame.sessionId &&
++			return frame.invocationAdmittedAtBirth && this._canAdmitToolInvocation() &&
++				frame.invocationGeneration === this._toolInvocationGeneration &&
++				frame.live && !frame.signal?.aborted && this.sessionId === frame.sessionId &&
+ 				this._cwd === frame.cwd && this._extensionRunner === frame.runner &&
+ 				this._registeredToolWrappers.get(frame.callerName) === caller &&
+ 				caller.registration === frame.caller && caller.registration.definition === frame.definition &&
+@@ -1440,6 +1490,7 @@
+ 	 * Call this when completely done with the session.
+ 	 */
+ 	dispose(): void {
++		this.closeToolInvocationsForDisposal();
+ 		try {
+ 			this.abortRetry();
+ 			this.abortCompaction();
+@@ -2345,15 +2396,22 @@
+ 	 * Abort current operation and wait for agent to become idle.
+ 	 */
+ 	async abort(): Promise<void> {
+-		if (this._isAgentRunActive) {
+-			this._agentRunAbortRequested = true;
+-		}
+-		this.abortRetry();
+-		this.abortCompaction();
+-		this.abortBranchSummary();
+-		if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;
+-		this.agent.abort();
+-		await this.waitForIdle();
++		const generation = this._beginToolInvocationTransition();
++		let succeeded = false;
++		try {
++			if (this._isAgentRunActive) {
++				this._agentRunAbortRequested = true;
++			}
++			this.abortRetry();
++			this.abortCompaction();
++			this.abortBranchSummary();
++			if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;
++			this.agent.abort();
++			await this.waitForIdle();
++			succeeded = true;
++		} finally {
++			this._finishToolInvocationTransition(generation, "abort", succeeded);
++		}
+ 	}
+ 
+ 	async waitForIdle(): Promise<void> {
+@@ -3561,29 +3619,36 @@
+ 	}
+ 
+ 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+-		const oldRunner = this._extensionRunner;
+-		const previousFlagValues = oldRunner.getFlagValues();
+-		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
+-		oldRunner.invalidate();
+-		await this.settingsManager.reload();
+-		this.syncQueueModesFromSettings();
+-		resetApiProviders();
+-		await this._resourceLoader.reload();
+-		this._buildRuntime({
+-			activeToolNames: this.getActiveToolNames(),
+-			flagValues: previousFlagValues,
+-			includeAllExtensionTools: true,
+-		});
+-
+-		const hasBindings =
+-			this._extensionUIContext ||
+-			this._extensionCommandContextActions ||
+-			this._extensionShutdownHandler ||
+-			this._extensionErrorListener;
+-		if (hasBindings) {
+-			await options?.beforeSessionStart?.();
+-			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+-			await this.extendResourcesFromExtensions("reload");
++		const generation = this._beginToolInvocationTransition();
++		let succeeded = false;
++		try {
++			const oldRunner = this._extensionRunner;
++			const previousFlagValues = oldRunner.getFlagValues();
++			await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
++			oldRunner.invalidate();
++			await this.settingsManager.reload();
++			this.syncQueueModesFromSettings();
++			resetApiProviders();
++			await this._resourceLoader.reload();
++			this._buildRuntime({
++				activeToolNames: this.getActiveToolNames(),
++				flagValues: previousFlagValues,
++				includeAllExtensionTools: true,
++			});
++
++			const hasBindings =
++				this._extensionUIContext ||
++				this._extensionCommandContextActions ||
++				this._extensionShutdownHandler ||
++				this._extensionErrorListener;
++			if (hasBindings) {
++				await options?.beforeSessionStart?.();
++				await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
++				await this.extendResourcesFromExtensions("reload");
++			}
++			succeeded = true;
++		} finally {
++			this._finishToolInvocationTransition(generation, "reload", succeeded);
+ 		}
+ 	}
+ 
+diff --git a/packages/coding-agent/test/suite/agent-session-tool-invocation-lifecycle.test.ts b/packages/coding-agent/test/suite/agent-session-tool-invocation-lifecycle.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/coding-agent/test/suite/agent-session-tool-invocation-lifecycle.test.ts
+@@ -0,0 +1,332 @@
++import type { Usage } from "@earendil-works/pi-ai/compat";
++import { describe, expect, it } from "vitest";
++import type { ToolInvocationResult } from "../../src/index.ts";
++import { createLifecycleFixture, finalUsage, type PausePoint, rawUsage } from "./host-invocation-lifecycle-fixture.ts";
++
++type Fixture = Awaited<ReturnType<typeof createLifecycleFixture>>;
++type Owner = ReturnType<Fixture["startOwner"]>;
++
++function expectDenied(result: ToolInvocationResult, message = "B1 lifecycle: denied result") {
++	expect(result.isError, message).toBe(true);
++	expect(result.content).not.toEqual([{ type: "text", text: "usable target content" }]);
++	expect(result.content).not.toEqual([{ type: "text", text: "usable final content" }]);
++	expect("usage" in result).toBe(false);
++}
++
++async function finishOwner(owner: Owner) {
++	owner.state.finish.release();
++	await owner.prompt;
++	expect(owner.state.returned).toBe(true);
++}
++
++async function expectFreshOwner(f: Fixture) {
++	const owner = f.startOwner();
++	const ctx = await f.wait(owner.state.entered.promise, owner.prompt);
++	expect(ctx.signal?.aborted).toBe(false);
++	expect(ctx.cwd).toBe(f.cwd);
++	expect(owner.state.attempts).toBe(0);
++	owner.state.proceed.release();
++	const result = await f.wait(owner.state.result.promise, owner.prompt);
++	expect(result.isError).toBe(false);
++	expect(result.content).toEqual([{ type: "text", text: "usable target content" }]);
++	expect("usage" in result).toBe(false);
++	await finishOwner(owner);
++}
++
++function expectOneContribution(f: Fixture, usage: Usage) {
++	const model = { input: 0, output: 0, cost: 0 };
++	for (const message of f.session.messages) {
++		if (message.role !== "assistant") continue;
++		model.input += message.usage.input;
++		model.output += message.usage.output;
++		model.cost += message.usage.cost.total;
++	}
++	const stats = f.session.getSessionStats();
++	expect(stats.tokens.input).toBe(model.input + usage.input);
++	expect(stats.tokens.output).toBe(model.output + usage.output);
++	expect(stats.cost).toBe(model.cost + usage.cost.total);
++	expect(stats.toolInvocations.known).toBe(1);
++	expect(stats.toolInvocations.pending).toBe(0);
++	expect(stats.toolInvocations.notEntered).toBe(0);
++	// Reading stats twice must not reapply the same retained contribution.
++	expect(f.session.getSessionStats()).toEqual(stats);
++}
++
++const windows: Array<{ id: string; title: string; transition: "reload" | "runtime-dispose"; point: PausePoint }> = [
++	{ id: "B1-01", title: "should deny an unused owner during reload shutdown [B1-01]", transition: "reload", point: "owner" },
++	{ id: "B1-02", title: "should deny an unused owner during runtime shutdown [B1-02]", transition: "runtime-dispose", point: "owner" },
++	{ id: "B1-03", title: "should deny policy continuation during reload shutdown [B1-03]", transition: "reload", point: "policy" },
++	{ id: "B1-04", title: "should deny policy continuation during runtime shutdown [B1-04]", transition: "runtime-dispose", point: "policy" },
++	{ id: "B1-05", title: "should deny preparation continuation during reload shutdown [B1-05]", transition: "reload", point: "preparation" },
++	{ id: "B1-06", title: "should deny preparation continuation during runtime shutdown [B1-06]", transition: "runtime-dispose", point: "preparation" },
++	{ id: "B1-07", title: "should retain raw usage but deny late execution content during reload [B1-07]", transition: "reload", point: "execution" },
++	{ id: "B1-08", title: "should retain raw usage but deny late execution content during runtime disposal [B1-08]", transition: "runtime-dispose", point: "execution" },
++	{ id: "B1-09", title: "should retain final usage but deny late finalized content during reload [B1-09]", transition: "reload", point: "finalization" },
++	{ id: "B1-10", title: "should retain final usage but deny late finalized content during runtime disposal [B1-10]", transition: "runtime-dispose", point: "finalization" },
++];
++
++describe("AgentSession B1 invocation lifecycle", () => {
++	// Literal ordinary it titles: no parameterized formatter/quoting/truncation of declared IDs.
++	for (const scenario of windows) {
++		it(scenario.title, async () => {
++			const f = await createLifecycleFixture(scenario.point);
++			try {
++				const owner = f.startOwner();
++				const ctx = await f.wait(owner.state.entered.promise, owner.prompt);
++				const runner = f.session.extensionRunner;
++				const registrations = runner.getAllRegisteredTools();
++				if (scenario.point !== "owner") {
++					owner.state.proceed.release();
++					await f.wait(f.checkpoint.entered, owner.prompt);
++				}
++				const shutdown = f.pauseShutdown();
++				const transition = f.own(scenario.transition === "reload" ? f.session.reload() : f.runtime.dispose());
++				await f.wait(shutdown.entered, transition);
++
++				// These preconditions must pass BEFORE the intended RED assertion.
++				// The owner is still executing; shutdown has not yet invalidated or aborted it.
++				expect(shutdown.released).toBe(false);
++				expect(f.lifecycle).toContain(`shutdown:1:${scenario.transition === "reload" ? "reload" : "quit"}`);
++				expect(owner.state.returned).toBe(false);
++				expect(owner.state.attempts).toBe(scenario.point === "owner" ? 0 : 1);
++				expect(ctx.signal?.aborted).toBe(false);
++				expect(ctx.cwd).toBe(f.cwd);
++				expect(f.session.extensionRunner).toBe(runner);
++				expect(f.session.getActiveToolNames().sort()).toEqual(["owner", "target"]);
++				for (const registration of registrations) {
++					expect(runner.getAllRegisteredTools().find((tool) => tool.definition.name === registration.definition.name)).toBe(registration);
++				}
++				expect(f.policyRequests).toHaveLength(scenario.point === "owner" ? 0 : 1);
++				if (scenario.point !== "owner") {
++					expect(f.policyRequests[0].caller).toBe(registrations.find((tool) => tool.definition.name === "owner"));
++					expect(f.policyRequests[0].target).toBe(registrations.find((tool) => tool.definition.name === "target"));
++				}
++				const enteredTarget = scenario.point === "execution" || scenario.point === "finalization";
++				expect(f.effects).toEqual(enteredTarget ? ["target"] : []);
++
++				if (scenario.point === "owner") owner.state.proceed.release();
++				else f.checkpoint.release();
++				const result = await f.wait(owner.state.result.promise, owner.prompt);
++				expect(owner.state.attempts).toBe(1);
++				expect(owner.state.returned).toBe(false);
++				expect(ctx.signal?.aborted).toBe(false);
++				expect(shutdown.released).toBe(false);
++				// A2 returns usable content here: neither origin nor existing liveness checks close this window.
++				expectDenied(result, `B1 lifecycle: ${scenario.id} denied content`);
++				expect(f.effects).toEqual(enteredTarget ? ["target"] : []);
++				const records = f.session.getToolInvocationRecords();
++				expect(records).toHaveLength(1);
++				expect(records[0]).toMatchObject({ status: "denied", execution: enteredTarget ? "entered" : "not-entered" });
++				if (enteredTarget) {
++					expect(records[0].rawUsage).toEqual({ state: "known", usage: rawUsage });
++					if (scenario.point === "finalization") {
++						expect(records[0].finalUsage).toEqual({ state: "known", usage: finalUsage });
++					}
++					expectOneContribution(f, scenario.point === "finalization" ? finalUsage : rawUsage);
++				} else {
++					expect(records[0].rawUsage).toEqual({ state: "not-entered" });
++					expect(records[0].finalUsage).toEqual({ state: "not-entered" });
++				}
++				await finishOwner(owner);
++				shutdown.release();
++				await transition;
++			} finally {
++				await f.cleanup();
++			}
++		});
++	}
++
++	it("should preserve ordinary owning invocation and exact policy identity [B1-11]", async () => {
++		const f = await createLifecycleFixture();
++		try {
++			const registrations = f.session.extensionRunner.getAllRegisteredTools();
++			await expectFreshOwner(f);
++			expect(f.effects).toEqual(["target"]);
++			expect(f.policyRequests).toHaveLength(1);
++			expect(f.policyRequests[0]).toMatchObject({ cwd: f.cwd, sessionId: f.session.sessionId, parentToolCallId: "b1-root-1" });
++			expect(f.policyRequests[0].caller).toBe(registrations.find((tool) => tool.definition.name === "owner"));
++			expect(f.policyRequests[0].target).toBe(registrations.find((tool) => tool.definition.name === "target"));
++			expect(f.session.model?.api).toBe("b3b-lifecycle-faux");
++			expect(f.session.model?.provider).toBe("anthropic");
++			expectOneContribution(f, rawUsage);
++		} finally { await f.cleanup(); }
++	});
++
++	it("should keep an aborted owner denied and admit a fresh owner after idle [B1-12]", async () => {
++		const f = await createLifecycleFixture();
++		try {
++			const owner = f.startOwner();
++			const ctx = await f.wait(owner.state.entered.promise, owner.prompt);
++			expect(owner.state.attempts).toBe(0);
++			const abort = f.own(f.session.abort());
++			expect(ctx.signal?.aborted).toBe(true);
++			expect(owner.state.returned).toBe(false);
++			owner.state.proceed.release();
++			expectDenied(await f.wait(owner.state.result.promise, owner.prompt));
++			expect(f.effects).toEqual([]);
++			await finishOwner(owner);
++			await abort;
++			await expectFreshOwner(f);
++			expect(f.effects).toEqual(["target"]);
++			expect(f.session.getToolInvocationRecords().map((record) => record.status)).toEqual(["denied", "completed"]);
++		} finally { await f.cleanup(); }
++	});
++
++	it("should admit a fresh owner only after real reload rebuild and startup [B1-13]", async () => {
++		const f = await createLifecycleFixture();
++		try {
++			await expectFreshOwner(f);
++			const oldRunner = f.session.extensionRunner;
++			await f.own(f.session.reload());
++			expect(f.session.extensionRunner).not.toBe(oldRunner);
++			expect(f.generation).toBe(2);
++			expect(f.lifecycle).toEqual(["start:1:startup", "shutdown:1:reload", "loader:2", "start:2:reload"]);
++			await expectFreshOwner(f);
++			expect(f.effects).toEqual(["target", "target"]);
++		} finally { await f.cleanup(); }
++	});
++
++	for (const scenario of [
++		{ before: true, title: "should never reactivate an old live owner after reload [B1-14]" },
++		{ before: false, title: "should never activate a frame born during closed reload [B1-15]" },
++	]) {
++		it(scenario.title, async () => {
++			const f = await createLifecycleFixture();
++			try {
++				const before = scenario.before ? f.startOwner() : undefined;
++				if (before) await f.wait(before.state.entered.promise, before.prompt);
++				const shutdown = f.pauseShutdown();
++				const reload = f.own(f.session.reload());
++				await f.wait(shutdown.entered, reload);
++				const owner = before ?? f.startOwner();
++				const ctx = await f.wait(owner.state.entered.promise, owner.prompt);
++				const oldRunner = f.session.extensionRunner;
++				expect(ctx.cwd).toBe(f.cwd);
++				expect(ctx.signal?.aborted).toBe(false);
++				expect(owner.state.attempts).toBe(0);
++				shutdown.release();
++				await reload;
++				expect(f.session.extensionRunner).not.toBe(oldRunner);
++				expect(owner.state.returned).toBe(false);
++				expect(ctx.signal?.aborted).toBe(false);
++				owner.state.proceed.release();
++				expectDenied(await f.wait(owner.state.result.promise, owner.prompt));
++				expect(f.effects).toEqual([]);
++				await finishOwner(owner);
++				await expectFreshOwner(f);
++				expect(f.effects).toEqual(["target"]);
++			} finally { await f.cleanup(); }
++		});
++	}
++
++	it("should close only invocation after failed reload until successful recovery [B1-16]", async () => {
++		const f = await createLifecycleFixture();
++		try {
++			const oldRunner = f.session.extensionRunner;
++			f.failReloadOnce();
++			await expect(f.own(f.session.reload(), true)).rejects.toThrow("B1 intentional loader failure");
++			expect(f.generation).toBe(2);
++			expect(f.session.extensionRunner).toBe(oldRunner);
++			await f.plainPrompt("ordinary session survived failed reload");
++			expect(f.session.messages.filter((message) => message.role === "assistant").at(-1)?.content)
++				.toEqual([{ type: "text", text: "ordinary session survived failed reload" }]);
++			const owner = f.startOwner();
++			const ctx = await f.wait(owner.state.entered.promise, owner.prompt);
++			// Generic context getters are already stale after failed reload; do not revive or bypass them.
++			expect(ctx.signal?.aborted).toBe(false);
++			expect(owner.state.attempts).toBe(0);
++			expect(owner.state.returned).toBe(false);
++			owner.state.proceed.release();
++			const result = await f.wait(owner.state.result.promise, owner.prompt);
++			expect(owner.state.attempts).toBe(1);
++			expect(owner.state.returned).toBe(false);
++			expect(ctx.signal?.aborted).toBe(false);
++			expectDenied(result, "B1 lifecycle: B1-16 failed reload stays closed");
++			expect(f.effects).toEqual([]);
++			await finishOwner(owner);
++			await f.own(f.session.reload());
++			expect(f.generation).toBe(3);
++			expect(f.lifecycle).toContain("start:3:reload");
++			await expectFreshOwner(f);
++			expect(f.effects).toEqual(["target"]);
++		} finally { await f.cleanup(); }
++	});
++
++	it("should not let an older reload completion reopen a newer transition [B1-17]", async () => {
++		const f = await createLifecycleFixture();
++		try {
++			const firstShutdown = f.pauseShutdown();
++			const first = f.own(f.session.reload());
++			await f.wait(firstShutdown.entered, first);
++			const secondShutdown = f.pauseShutdown();
++			const second = f.own(f.session.reload());
++			await f.wait(secondShutdown.entered, second);
++			firstShutdown.release();
++			await first;
++			expect(f.generation).toBe(2);
++			expect(secondShutdown.released).toBe(false);
++			const owner = f.startOwner();
++			const ctx = await f.wait(owner.state.entered.promise, owner.prompt);
++			expect(ctx.cwd).toBe(f.cwd);
++			expect(ctx.signal?.aborted).toBe(false);
++			expect(owner.state.attempts).toBe(0);
++			owner.state.proceed.release();
++			const result = await f.wait(owner.state.result.promise, owner.prompt);
++			expect(owner.state.returned).toBe(false);
++			expect(owner.state.attempts).toBe(1);
++			expect(ctx.signal?.aborted).toBe(false);
++			expect(secondShutdown.released).toBe(false);
++			expectDenied(result, "B1 lifecycle: B1-17 newer transition stays closed");
++			expect(f.effects).toEqual([]);
++			await finishOwner(owner);
++			secondShutdown.release();
++			await second;
++			await expectFreshOwner(f);
++			expect(f.effects).toEqual(["target"]);
++		} finally { await f.cleanup(); }
++	});
++
++	it("should keep disposal terminal when an older reload completes later [B1-18]", async () => {
++		const f = await createLifecycleFixture();
++		try {
++			const shutdown = f.pauseShutdown();
++			const reload = f.own(f.session.reload());
++			await f.wait(shutdown.entered, reload);
++			f.session.dispose();
++			f.session.dispose();
++			shutdown.release();
++			await reload;
++			expect(f.generation).toBe(2);
++			const owner = f.startOwner();
++			const ctx = await f.wait(owner.state.entered.promise, owner.prompt);
++			expect(ctx.cwd).toBe(f.cwd);
++			expect(ctx.signal?.aborted).toBe(false);
++			expect(owner.state.attempts).toBe(0);
++			owner.state.proceed.release();
++			const result = await f.wait(owner.state.result.promise, owner.prompt);
++			expect(owner.state.returned).toBe(false);
++			expect(owner.state.attempts).toBe(1);
++			expect(ctx.signal?.aborted).toBe(false);
++			expectDenied(result, "B1 lifecycle: B1-18 disposal remains terminal");
++			expect(f.effects).toEqual([]);
++			await finishOwner(owner);
++		} finally { await f.cleanup(); }
++	});
++
++	it("should preserve direct disposal denial for a still executing owner [B1-19]", async () => {
++		const f = await createLifecycleFixture();
++		try {
++			const owner = f.startOwner();
++			const ctx = await f.wait(owner.state.entered.promise, owner.prompt);
++			expect(owner.state.attempts).toBe(0);
++			f.session.dispose();
++			expect(ctx.signal?.aborted).toBe(true);
++			expect(owner.state.returned).toBe(false);
++			owner.state.proceed.release();
++			expectDenied(await f.wait(owner.state.result.promise, owner.prompt));
++			expect(f.effects).toEqual([]);
++			expect(f.session.getToolInvocationRecords()[0]).toMatchObject({ status: "denied", execution: "not-entered" });
++			await finishOwner(owner);
++		} finally { await f.cleanup(); }
++	});
++});
+diff --git a/packages/coding-agent/test/suite/host-invocation-lifecycle-fixture.ts b/packages/coding-agent/test/suite/host-invocation-lifecycle-fixture.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/coding-agent/test/suite/host-invocation-lifecycle-fixture.ts
+@@ -0,0 +1,305 @@
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { Agent, type AgentMessage, type AgentToolResult } from "@earendil-works/pi-agent-core";
++import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
++import {
++	fauxAssistantMessage,
++	fauxToolCall,
++	registerFauxProvider,
++	streamSimple,
++	type FauxProviderRegistration,
++	type Usage,
++} from "@earendil-works/pi-ai/compat";
++import { Type } from "typebox";
++import { AgentSession, type ToolInvocationPolicy } from "../../src/core/agent-session.ts";
++import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
++import type { AgentSessionServices } from "../../src/core/agent-session-services.ts";
++import type { ExtensionRunner } from "../../src/core/extensions/index.ts";
++import { convertToLlm } from "../../src/core/messages.ts";
++import { ModelRuntime } from "../../src/core/model-runtime.ts";
++import type { ResourceLoader } from "../../src/core/resource-loader.ts";
++import { SessionManager } from "../../src/core/session-manager.ts";
++import { SettingsManager } from "../../src/core/settings-manager.ts";
++import {
++	defineTool,
++	type ExtensionFactory,
++	type ToolExecutionContext,
++	type ToolInvocationResult,
++} from "../../src/index.ts";
++import { createTestExtensionsResult } from "../utilities.ts";
++
++export type PausePoint = "owner" | "policy" | "preparation" | "execution" | "finalization";
++
++export const rawUsage: Usage = {
++	input: 3, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 5,
++	cost: { input: 0.25, output: 0.25, cacheRead: 0, cacheWrite: 0, total: 0.5 },
++};
++export const finalUsage: Usage = {
++	input: 7, output: 11, cacheRead: 0, cacheWrite: 0, totalTokens: 18,
++	cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 },
++};
++
++function textResult(text: string): AgentToolResult<undefined> {
++	return { content: [{ type: "text", text }], details: undefined };
++}
++
++function deferred<T>() {
++	let resolve!: (value: T) => void;
++	const promise = new Promise<T>((fulfill) => { resolve = fulfill; });
++	return { promise, resolve };
++}
++
++function gate() {
++	const entered = deferred<void>();
++	const resume = deferred<void>();
++	let released = false;
++	return {
++		entered: entered.promise,
++		get released() { return released; },
++		release() { released = true; resume.resolve(); },
++		async wait() { entered.resolve(); await resume.promise; },
++	};
++}
++
++type Gate = ReturnType<typeof gate>;
++interface OwnerState {
++	entered: ReturnType<typeof deferred<ToolExecutionContext>>;
++	result: ReturnType<typeof deferred<ToolInvocationResult>>;
++	proceed: Gate;
++	finish: Gate;
++	attempts: number;
++	returned: boolean;
++}
++
++/** Dedicated compat-only fixture. No ModelRuntime provider registration/refresh or default services. */
++export async function createLifecycleFixture(pauseAt: PausePoint = "owner") {
++	const cwd = mkdtempSync(join(tmpdir(), "pi-suite-"));
++	const gates: Gate[] = [];
++	const pending: Array<{ promise: Promise<unknown>; allowRejection: boolean }> = [];
++	const owners: OwnerState[] = [];
++	const shutdowns: Gate[] = [];
++	const effects: string[] = [];
++	const lifecycle: string[] = [];
++	const extensionErrors: string[] = [];
++	const policyRequests: Array<Parameters<ToolInvocationPolicy>[0]> = [];
++	let currentFaux: FauxProviderRegistration | undefined;
++	let createdSession: AgentSession | undefined;
++	let generation = 0;
++	let rootId = 0;
++	let failNextReload = false;
++
++	function own<T>(promise: Promise<T>, allowRejection = false): Promise<T> {
++		pending.push({ promise, allowRejection });
++		// Attach immediately, including to deliberately rejected loader/reload operations.
++		// Return the original promise: callers still assert its real disposition.
++		void promise.catch(() => {});
++		return promise;
++	}
++
++	function newGate(): Gate {
++		const value = gate();
++		gates.push(value);
++		return value;
++	}
++
++	function faux(): FauxProviderRegistration {
++		if (!currentFaux) throw new Error("Lifecycle fixture has no current faux transport");
++		return currentFaux;
++	}
++
++	function installFaux(): FauxProviderRegistration {
++		// Retire BEFORE replacement; an old handle must never unregister its successor.
++		currentFaux?.unregister();
++		currentFaux = registerFauxProvider({
++			api: "b3b-lifecycle-faux",
++			provider: "anthropic",
++			models: [{ id: "b3b-lifecycle", input: ["text"], reasoning: false }],
++		});
++		currentFaux.setResponses([fauxAssistantMessage("reload transport complete")]);
++		return currentFaux;
++	}
++
++	const checkpoint = newGate();
++	const factory: ExtensionFactory = (pi) => {
++		const factoryGeneration = ++generation;
++		pi.registerTool(defineTool({
++			name: "owner", label: "Owner", description: "Real lifecycle owner", parameters: Type.Object({}),
++			async execute(_id, _args, _signal, _update, ctx) {
++				const state = owners.shift();
++				if (!state) throw new Error("Unplanned lifecycle owner execution");
++				try {
++					state.entered.resolve(ctx);
++					await state.proceed.wait();
++					state.attempts++;
++					// This is the actual definition's continuation, never a borrowed callback.
++					const result = await own(ctx.invokeTool("target", {}));
++					state.result.resolve(result);
++					await state.finish.wait();
++					return textResult("owner complete");
++				} finally {
++					state.returned = true;
++				}
++			},
++		}));
++		pi.registerTool(defineTool({
++			name: "target", label: "Target", description: "Observed inline effect", parameters: Type.Object({}),
++			async execute() {
++				effects.push("target");
++				if (pauseAt === "execution") await checkpoint.wait();
++				return { ...textResult("usable target content"), usage: rawUsage };
++			},
++		}));
++		pi.on("tool_call", async (event) => {
++			if (event.toolName === "target" && pauseAt === "preparation") await checkpoint.wait();
++		});
++		pi.on("tool_result", async (event) => {
++			if (event.toolName !== "target" || pauseAt !== "finalization") return;
++			await checkpoint.wait();
++			return { ...textResult("usable final content"), usage: finalUsage };
++		});
++		pi.on("session_start", (event) => { lifecycle.push(`start:${factoryGeneration}:${event.reason}`); });
++		pi.on("session_shutdown", async (event) => {
++			lifecycle.push(`shutdown:${factoryGeneration}:${event.reason}`);
++			await shutdowns.shift()?.wait();
++		});
++	};
++
++	try {
++		const credentials = new InMemoryCredentialStore();
++		await credentials.modify("anthropic", async () => ({ type: "api_key", key: "b3b-faux-key" }));
++		const modelRuntime = await ModelRuntime.create({
++			credentials, modelsPath: null, allowModelNetwork: false, refreshOnCreate: false,
++		});
++		const model = installFaux().getModel();
++		const sessionManager = SessionManager.inMemory(cwd);
++		const settingsManager = SettingsManager.inMemory({
++			retry: { enabled: false }, compaction: { enabled: false },
++		});
++		const extensionRunnerRef: { current?: ExtensionRunner } = {};
++		const agent = new Agent({
++			getApiKey: () => "b3b-faux-key",
++			streamFn: streamSimple,
++			initialState: { model, tools: [], systemPrompt: "" },
++			convertToLlm,
++			onPayload: async (payload) => {
++				const runner = extensionRunnerRef.current;
++				return runner?.hasHandlers("before_provider_request") ? runner.emitBeforeProviderRequest(payload) : payload;
++			},
++			onResponse: async (response) => {
++				const runner = extensionRunnerRef.current;
++				if (runner?.hasHandlers("after_provider_response")) {
++					await runner.emit({ type: "after_provider_response", status: response.status, headers: response.headers });
++				}
++			},
++			transformContext: async (messages: AgentMessage[]) => {
++				const runner = extensionRunnerRef.current;
++				return runner ? runner.emitContext(messages) : messages;
++			},
++		});
++		let extensionsResult = await createTestExtensionsResult([factory], cwd);
++		const resourceLoader: ResourceLoader = {
++			getExtensions: () => extensionsResult,
++			getSkills: () => ({ skills: [], diagnostics: [] }),
++			getPrompts: () => ({ prompts: [], diagnostics: [] }),
++			getThemes: () => ({ themes: [], diagnostics: [] }),
++			getAgentsFiles: () => ({ agentsFiles: [] }),
++			getSystemPrompt: () => "",
++			getSystemPromptSource: () => undefined,
++			getAppendSystemPrompt: () => [],
++			getAppendSystemPromptSources: () => [],
++			extendResources: () => {},
++			reload() {
++				const fail = failNextReload;
++				failNextReload = false;
++				return own((async () => {
++					// Real session.reload has just reset compat APIs. Reinstall even on failure.
++					installFaux();
++					extensionsResult = await createTestExtensionsResult([factory], cwd);
++					lifecycle.push(`loader:${generation}`);
++					if (fail) throw new Error("B1 intentional loader failure");
++				})(), fail);
++			},
++		};
++		const session = new AgentSession({
++			agent, sessionManager, settingsManager, cwd, modelRuntime, resourceLoader,
++			baseToolsOverride: {}, extensionRunnerRef,
++			toolInvocationPolicy: async (request) => {
++				policyRequests.push(request);
++				const registrations = extensionRunnerRef.current?.getAllRegisteredTools() ?? [];
++				const admitted = request.caller === registrations.find((tool) => tool.definition.name === "owner") &&
++					request.target === registrations.find((tool) => tool.definition.name === "target") &&
++					request.sessionId === sessionManager.getSessionId() && request.cwd === cwd;
++				if (pauseAt === "policy") await checkpoint.wait();
++				return admitted;
++			},
++		});
++		createdSession = session;
++		await session.bindExtensions({ onError: (error) => { extensionErrors.push(error.error); } });
++		const services: AgentSessionServices = {
++			cwd, agentDir: cwd, modelRuntime, settingsManager, resourceLoader, diagnostics: [],
++		};
++		const runtime = new AgentSessionRuntime(session, services, async () => {
++			throw new Error("B3-B2 replacement factory must not be called");
++		});
++
++		return {
++			session, runtime, cwd, checkpoint, effects, lifecycle, policyRequests, own,
++			get generation() { return generation; },
++			failReloadOnce() { failNextReload = true; },
++			pauseShutdown() {
++				const pause = newGate();
++				shutdowns.push(pause);
++				return pause;
++			},
++			startOwner() {
++				const state: OwnerState = {
++					entered: deferred<ToolExecutionContext>(), result: deferred<ToolInvocationResult>(),
++					proceed: newGate(), finish: newGate(), attempts: 0, returned: false,
++				};
++				owners.push(state);
++				faux().setResponses([
++					fauxAssistantMessage(fauxToolCall("owner", {}, { id: `b1-root-${++rootId}` }), { stopReason: "toolUse" }),
++					fauxAssistantMessage("owner transport complete"),
++				]);
++				return { state, prompt: own(session.prompt("Exercise lifecycle owner", { expandPromptTemplates: false })) };
++			},
++			plainPrompt(text: string) {
++				faux().setResponses([fauxAssistantMessage(text)]);
++				return own(session.prompt("Exercise ordinary session", { expandPromptTemplates: false }));
++			},
++			wait<T>(notification: Promise<T>, operation: Promise<void>): Promise<T> {
++				return Promise.race([notification, operation.then(() => {
++					throw new Error("Lifecycle operation completed before its expected checkpoint");
++				})]);
++			},
++			async cleanup() {
++				// All blocking gates exist before their operations; no cleanup-created pause.
++				for (const pause of gates) pause.release();
++				await Promise.allSettled(pending.map((entry) => entry.promise));
++				// Releasing an owner can create its invocation/loader promise. Observe those too.
++				const entries = [...pending];
++				const settlements = await Promise.allSettled(entries.map((entry) => entry.promise));
++				try {
++					await session.waitForIdle();
++					const errors: unknown[] = [...extensionErrors];
++					settlements.forEach((settlement, index) => {
++						if (settlement.status === "rejected" && !entries[index].allowRejection) errors.push(settlement.reason);
++					});
++					if (errors.length > 0) throw new AggregateError(errors, "Unexpected lifecycle fixture failure");
++				} finally {
++					session.dispose();
++					faux().unregister();
++					rmSync(cwd, { recursive: true });
++				}
++			},
++		};
++	} catch (error) {
++		for (const pause of gates) pause.release();
++		await Promise.allSettled(pending.map((entry) => entry.promise));
++		createdSession?.dispose();
++		currentFaux?.unregister();
++		rmSync(cwd, { recursive: true });
++		throw error;
++	}
++}
