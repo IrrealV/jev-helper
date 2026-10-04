@@ -1,0 +1,530 @@
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -143,6 +143,11 @@
+ 	type NormalizedBuildSystemPromptOptions,
+ 	normalizeBuildSystemPromptOptions,
+ } from "./system-prompt.ts";
++import {
++	isToolInvocationOrigin,
++	runWithToolInvocationOrigin,
++	withoutToolInvocationOrigin,
++} from "./tool-invocation-scope.ts";
+ import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
+ import { createAllToolDefinitions } from "./tools/index.ts";
+ import { createToolDefinitionFromAgentTool, type ToolExecutionBinding } from "./tools/tool-definition-wrapper.ts";
+@@ -720,7 +725,7 @@
+ 					record.rawUsage = { state: "pending" };
+ 				}
+ 				try {
+-					const result = await execute();
++					const result = await runWithToolInvocationOrigin(frame, execute);
+ 					// Observe the actual definition promise BEFORE executor update settlement.
+ 					if (record) record.rawUsage = observeInvocationUsage(result.usage);
+ 					return result;
+@@ -741,9 +746,10 @@
+ 		const denied = (reason: string): ToolInvocationResult => ({
+ 			content: [{ type: "text", text: reason }], details: undefined, isError: true, invocationId,
+ 		});
+-		// Consume synchronously, including denied policy/invalid target/capacity attempts.
++		// Only the owning origin consumes an attempt, including policy/invalid target/capacity denials.
++		const hasOrigin = isToolInvocationOrigin(frame);
+ 		const alreadyAttempted = frame.attempted;
+-		if (frame.live && frame.depth === 0) frame.attempted = true;
++		if (hasOrigin && frame.live && frame.depth === 0) frame.attempted = true;
+ 		// Retain every admitted record. Capacity is checked before policy, hooks or target effects.
+ 		if (this._toolInvocationRecords.length >= 128) return denied("Tool invocation ledger is full");
+ 		const record: ToolInvocationRecord = {
+@@ -753,6 +759,7 @@
+ 		};
+ 		this._toolInvocationRecords.push(record);
+ 		if (!frame.live) return denied("Parent tool execution has completed");
++		if (!hasOrigin) return denied("Tool invocation requires its owning execution origin");
+ 		if (frame.depth !== 0) return denied("Nested tool invocation depth exceeded");
+ 		if (alreadyAttempted) return denied("Parent tool invocation attempt already consumed");
+ 		const caller = this._registeredToolWrappers.get(frame.callerName);
+@@ -1095,7 +1102,7 @@
+ 	/** Emit an event to all listeners */
+ 	private _emit(event: AgentSessionEvent): void {
+ 		for (const l of this._eventListeners) {
+-			l(event);
++			withoutToolInvocationOrigin(() => l(event));
+ 		}
+ 	}
+ 
+@@ -2041,7 +2048,7 @@
+ 		const ctx = this._extensionRunner.createCommandContext();
+ 
+ 		try {
+-			await command.handler(args, ctx);
++			await withoutToolInvocationOrigin(() => command.handler(args, ctx));
+ 			return true;
+ 		} catch (err) {
+ 			// Emit error via extension runner
+diff --git a/packages/coding-agent/src/core/event-bus.ts b/packages/coding-agent/src/core/event-bus.ts
+--- a/packages/coding-agent/src/core/event-bus.ts
++++ b/packages/coding-agent/src/core/event-bus.ts
+@@ -1,4 +1,5 @@
+ import { EventEmitter } from "node:events";
++import { withoutToolInvocationOrigin } from "./tool-invocation-scope.ts";
+ 
+ export interface EventBus {
+ 	emit(channel: string, data: unknown): void;
+@@ -18,7 +19,7 @@
+ 		on: (channel, handler) => {
+ 			const safeHandler = async (data: unknown) => {
+ 				try {
+-					await handler(data);
++					await withoutToolInvocationOrigin(() => handler(data));
+ 				} catch (err) {
+ 					console.error(`Event handler error (${channel}):`, err);
+ 				}
+diff --git a/packages/coding-agent/src/core/extensions/runner.ts b/packages/coding-agent/src/core/extensions/runner.ts
+--- a/packages/coding-agent/src/core/extensions/runner.ts
++++ b/packages/coding-agent/src/core/extensions/runner.ts
+@@ -24,6 +24,7 @@
+ 	type NormalizedBuildSystemPromptOptions,
+ 	normalizeBuildSystemPromptOptions,
+ } from "../system-prompt.ts";
++import { withoutToolInvocationOrigin } from "../tool-invocation-scope.ts";
+ import type {
+ 	AgentBeforeSettleEvent,
+ 	BeforeAgentStartEvent,
+@@ -263,7 +264,13 @@
+ }
+ 
+ function snapshotEventHandlers(extensions: Extension[], event: ExtensionEvent["type"]) {
+-	return extensions.map((ext) => ({ ext, handlers: ext.handlers.get(event)?.slice() ?? [] }));
++	return extensions.map((ext) => ({
++		ext,
++		// Wrap delivery, not registration: supplied handler maps use this boundary too.
++		handlers: ext.handlers.get(event)?.slice().map(
++			(handler) => (...args: Parameters<typeof handler>) => withoutToolInvocationOrigin(() => handler(...args)),
++		) ?? [],
++	}));
+ }
+ 
+ function sameMessages(left: AgentMessage[], right: AgentMessage[]): boolean {
+@@ -698,7 +705,7 @@
+ 
+ 	emitError(error: ExtensionError): void {
+ 		for (const listener of this.errorListeners) {
+-			listener(error);
++			withoutToolInvocationOrigin(() => listener(error));
+ 		}
+ 	}
+ 
+diff --git a/packages/coding-agent/src/core/tool-invocation-scope.ts b/packages/coding-agent/src/core/tool-invocation-scope.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/coding-agent/src/core/tool-invocation-scope.ts
+@@ -0,0 +1,19 @@
++import { AsyncLocalStorage } from "node:async_hooks";
++
++// Internal only: the owning session's private frame is the identity, never a name or public context.
++const toolInvocationOrigin = new AsyncLocalStorage<object | undefined>();
++
++/** Enter only around the owning registered definition's execution. */
++export function runWithToolInvocationOrigin<T>(frame: object, execute: () => T): T {
++	return toolInvocationOrigin.run(frame, execute);
++}
++
++/** Clear this authority for a callback and its async descendants, restoring the caller on return. */
++export function withoutToolInvocationOrigin<T>(callback: () => T): T {
++	return toolInvocationOrigin.run(undefined, callback);
++}
++
++/** Compare identity without exposing the current frame to callers. */
++export function isToolInvocationOrigin(frame: object): boolean {
++	return toolInvocationOrigin.getStore() === frame;
++}
+diff --git a/packages/coding-agent/src/core/tools/tool-definition-wrapper.ts b/packages/coding-agent/src/core/tools/tool-definition-wrapper.ts
+--- a/packages/coding-agent/src/core/tools/tool-definition-wrapper.ts
++++ b/packages/coding-agent/src/core/tools/tool-definition-wrapper.ts
+@@ -1,6 +1,7 @@
+ import { randomUUID } from "node:crypto";
+ import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
+ import type { ExtensionContext, ToolDefinition, ToolExecutionContext } from "../extensions/types.ts";
++import { withoutToolInvocationOrigin } from "../tool-invocation-scope.ts";
+ 
+ /** Internal execution adapter seam; only an owning host can supply a binding. */
+ export interface ToolExecutionBinding {
+@@ -39,17 +40,18 @@
+ 		constrainedSampling: definition.constrainedSampling,
+ 		prepareArguments: definition.prepareArguments,
+ 		executionMode: definition.executionMode,
+-		execute: (toolCallId, params, signal, onUpdate, ctx?: ExtensionContext) => {
+-			if (bindExecution) {
+-				const binding = bindExecution(toolCallId, signal);
+-				return binding.run(() => definition.execute(toolCallId, params, signal, onUpdate, binding.context));
+-			}
+-			const context = ctx ?? ctxFactory?.();
+-			// Standalone built-ins historically receive undefined when no context is supplied.
+-			// Preserve that behavior; do not fabricate an ExtensionContext for them.
+-			const executionContext = context ? withoutToolInvocation(context) : undefined;
+-			return definition.execute(toolCallId, params, signal, onUpdate, executionContext as ToolExecutionContext);
+-		},
++		execute: (toolCallId, params, signal, onUpdate, ctx?: ExtensionContext) =>
++			withoutToolInvocationOrigin(() => {
++				if (bindExecution) {
++					const binding = bindExecution(toolCallId, signal);
++					return binding.run(() => definition.execute(toolCallId, params, signal, onUpdate, binding.context));
++				}
++				const context = ctx ?? ctxFactory?.();
++				// Standalone built-ins historically receive undefined when no context is supplied.
++				// Preserve that behavior; do not fabricate an ExtensionContext for them.
++				const executionContext = context ? withoutToolInvocation(context) : undefined;
++				return definition.execute(toolCallId, params, signal, onUpdate, executionContext as ToolExecutionContext);
++			}),
+ 	};
+ }
+ 
+diff --git a/packages/coding-agent/test/suite/agent-session-tool-invocation-origin.test.ts b/packages/coding-agent/test/suite/agent-session-tool-invocation-origin.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/coding-agent/test/suite/agent-session-tool-invocation-origin.test.ts
+@@ -0,0 +1,344 @@
++import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
++import { Type } from "typebox";
++import { describe, expect, it } from "vitest";
++import {
++	defineTool,
++	type ExtensionAPI,
++	type ExtensionError,
++	type ToolExecutionContext,
++	type ToolInvocationResult,
++	wrapRegisteredTool,
++} from "../../src/index.ts";
++import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
++import { createHarness, type Harness } from "./harness.ts";
++
++type Boundary = "hook" | "supplied-hook" | "bus" | "peer" | "tool-call" | "tool-result" |
++	"session-listener" | "error-listener" | "command" | "standalone" | "owner-await";
++type Scenario = { name: string; boundary: Boundary; afterAwait: boolean };
++
++const cases = [
++	{ name: "registered update hook directly [A2-01]", boundary: "hook", afterAwait: false },
++	{ name: "registered update hook after await [A2-02]", boundary: "hook", afterAwait: true },
++	{ name: "supplied update handler directly [A2-03]", boundary: "supplied-hook", afterAwait: false },
++	{ name: "supplied update handler after await [A2-04]", boundary: "supplied-hook", afterAwait: true },
++	{ name: "event-bus listener directly [A2-05]", boundary: "bus", afterAwait: false },
++	{ name: "event-bus listener after await [A2-06]", boundary: "bus", afterAwait: true },
++	{ name: "parallel registered tool [A2-07]", boundary: "peer", afterAwait: false },
++	{ name: "tool_call hook on a parallel nested call [A2-08]", boundary: "tool-call", afterAwait: false },
++	{ name: "tool_result hook on a parallel nested call [A2-09]", boundary: "tool-result", afterAwait: false },
++	{ name: "public session listener directly [A2-10]", boundary: "session-listener", afterAwait: false },
++	{ name: "public session listener after await [A2-11]", boundary: "session-listener", afterAwait: true },
++	{ name: "runner error listener directly [A2-12]", boundary: "error-listener", afterAwait: false },
++	{ name: "runner error listener after await [A2-13]", boundary: "error-listener", afterAwait: true },
++	{ name: "extension command directly [A2-14]", boundary: "command", afterAwait: false },
++	{ name: "extension command after await [A2-15]", boundary: "command", afterAwait: true },
++	{ name: "standalone registered adapter directly [A2-16]", boundary: "standalone", afterAwait: false },
++	{ name: "standalone registered adapter after await [A2-17]", boundary: "standalone", afterAwait: true },
++] as const satisfies readonly Scenario[];
++
++function deferred() {
++	let resolve!: () => void;
++	const promise = new Promise<void>((fulfill) => { resolve = fulfill; });
++	return { promise, resolve };
++}
++
++function textResult(text: string) {
++	return { content: [{ type: "text" as const, text }], details: undefined };
++}
++
++async function fixture(scenario: Scenario) {
++	const { boundary, afterAwait } = scenario;
++	const parallel = boundary === "peer" || boundary === "tool-call" || boundary === "tool-result";
++	const peerFinished = deferred();
++	const pending: Promise<unknown>[] = [];
++	const borrowWork: Promise<void>[] = [];
++	const faults: string[] = [];
++	const errors: ExtensionError[] = [];
++	const effects: string[] = [];
++	const preparations: string[] = [];
++	const policies: string[] = [];
++	const borrowEffects: string[][] = [];
++	const borrowPreparations: string[][] = [];
++	const borrowPolicies: string[][] = [];
++	const borrowStates: Array<{ live: boolean; attempts: number; peerLive: boolean }> = [];
++	const borrowedResults: ToolInvocationResult[] = [];
++	const ownerResults: ToolInvocationResult[] = [];
++	const peerResults: ToolInvocationResult[] = [];
++	const commandArguments: string[] = [];
++	let api!: ExtensionAPI;
++	let harness!: Harness;
++	let borrowedInvoke: ToolExecutionContext["invokeTool"] | undefined;
++	let ownerLive = false;
++	let ownerAttempts = 0;
++	let peerLive = false;
++	let peerPrepared = false;
++
++	function track<T>(work: Promise<T>): Promise<T> {
++		pending.push(work);
++		// Observe detached listener rejections immediately; assertions remain outside host callbacks.
++		void work.catch((error: unknown) => { faults.push(String(error)); });
++		return work;
++	}
++
++	function beginBorrow(): Promise<void> {
++		const work = track((async () => {
++			if (afterAwait) await Promise.resolve();
++			borrowStates.push({ live: ownerLive, attempts: ownerAttempts, peerLive });
++			if (!borrowedInvoke) throw new Error("Borrowing callback ran before the owner minted its capability");
++			borrowedResults.push(await borrowedInvoke("target", { source: "borrowed" }));
++			// Captured before the owner is allowed its first attempt, not after owner completion.
++			borrowEffects.push([...effects]);
++			borrowPreparations.push([...preparations]);
++			borrowPolicies.push(policies.filter((name) => name === "owner->target"));
++		})());
++		borrowWork.push(work);
++		return work;
++	}
++
++	const target = defineTool({
++		name: "target", label: "Target", description: "Text-only origin target",
++		parameters: Type.Object({ source: Type.String() }), executionMode: "parallel",
++		prepareArguments(args) {
++			if (typeof args !== "object" || args === null || !("source" in args) || typeof args.source !== "string") {
++				throw new Error("Expected a synthetic source argument");
++			}
++			preparations.push(args.source);
++			return { source: args.source };
++		},
++		async execute(_id, args) {
++			effects.push(args.source);
++			return textResult(`target:${args.source}`);
++		},
++	});
++	const probe = defineTool({
++		name: "probe", label: "Probe", description: "Peer-owned synthetic child",
++		parameters: Type.Object({}), executionMode: "parallel",
++		async execute() { return textResult("probe completed"); },
++	});
++	const standalone = defineTool({
++		name: "standalone", label: "Standalone", description: "Non-owning adapter entry",
++		parameters: Type.Object({}), executionMode: "parallel",
++		async execute() {
++			await beginBorrow();
++			return textResult("standalone completed");
++		},
++	});
++	const owner = defineTool({
++		name: "owner", label: "Owner", description: "Real registered capability owner",
++		parameters: Type.Object({}), executionMode: "parallel",
++		async execute(_id, _args, signal, onUpdate, ctx) {
++			borrowedInvoke = ctx.invokeTool;
++			ownerLive = true;
++			try {
++				await Promise.resolve();
++				if (parallel) {
++					// Real parallel preflight precedes ALL execution. Never wait inside a root tool_call hook.
++					if (!peerPrepared) throw new Error("Peer preflight did not precede parallel owner execution");
++					await peerFinished.promise;
++				} else if (boundary === "hook" || boundary === "supplied-hook" || boundary === "error-listener") {
++					if (!onUpdate) throw new Error("Registered owner did not receive its actual update callback");
++					onUpdate(textResult("owner progress before first invocation"));
++				} else if (boundary === "bus") {
++					api.events.emit("a2:borrow", undefined);
++				} else if (boundary === "session-listener") {
++					// Empty-queue notification only: no persistence or replacement operation.
++					harness.session.clearQueue();
++				} else if (boundary === "command") {
++					// Public prompt dispatch handles registered commands before its streaming guard.
++					await track(harness.session.prompt("/origin-probe origin-argument"));
++				} else if (boundary === "standalone") {
++					const runner = harness.session.extensionRunner;
++					const registration = runner.getAllRegisteredTools().find((tool) => tool.definition === standalone);
++					if (!registration) throw new Error("Missing real standalone registration");
++					await track(wrapRegisteredTool(registration, runner).execute("standalone-call", {}, signal));
++				}
++				if (boundary !== "owner-await") {
++					// These entrypoints enter their callback synchronously (even an async descendant).
++					// Diagnose missing delivery instead of waiting forever on a callback-owned deferred.
++					if (borrowWork.length !== 1) throw new Error(`Expected exactly one ${boundary} borrowing callback`);
++					await borrowWork[0];
++				}
++				await Promise.resolve();
++				ownerAttempts++;
++				ownerResults.push(await track(ctx.invokeTool("target", { source: "owner" })));
++				await Promise.resolve();
++				ownerAttempts++;
++				ownerResults.push(await track(ctx.invokeTool("target", { source: "repeat" })));
++				return textResult("owner completed");
++			} finally {
++				ownerLive = false;
++			}
++		},
++	});
++	const peer = defineTool({
++		name: "peer", label: "Peer", description: "Real simultaneous registered execution",
++		parameters: Type.Object({}), executionMode: "parallel",
++		async execute(_id, _args, _signal, _onUpdate, ctx) {
++			peerLive = true;
++			try {
++				if (!ownerLive) throw new Error("Peer did not overlap a live owner execution");
++				if (boundary === "peer") await beginBorrow();
++				else peerResults.push(await track(ctx.invokeTool("probe", {})));
++				return textResult("peer completed");
++			} finally {
++				peerLive = false;
++				peerFinished.resolve();
++			}
++		},
++	});
++
++	const extensionsResult = await createTestExtensionsResult([{ name: "a2-origin", factory: (pi) => {
++		api = pi;
++		pi.registerTool(owner);
++		pi.registerTool(target);
++		pi.registerTool(peer);
++		pi.registerTool(probe);
++		pi.registerTool(standalone);
++		pi.on("tool_call", (event) => {
++			if (event.toolName === "peer") peerPrepared = true;
++			if (boundary === "tool-call" && event.toolName === "probe") return beginBorrow();
++		});
++		pi.on("tool_result", (event) => {
++			if (boundary === "tool-result" && event.toolName === "probe") return beginBorrow();
++		});
++		if (boundary === "hook") pi.on("tool_execution_update", () => beginBorrow());
++		if (boundary === "error-listener") {
++			pi.on("tool_execution_update", () => { throw new Error("A2 synthetic update failure"); });
++		}
++		if (boundary === "bus") pi.events.on("a2:borrow", () => beginBorrow());
++		pi.registerCommand("origin-probe", {
++			description: "In-process synthetic origin probe",
++			handler: async (args) => { commandArguments.push(args); await beginBorrow(); },
++		});
++	} }]);
++	if (boundary === "supplied-hook") {
++		// Public ResourceLoader input assembled before the SUT exists, not runner-field replacement.
++		// Bypasses pi.on so loader-only wrapping cannot satisfy these cases.
++		extensionsResult.extensions[0].handlers.set("tool_execution_update", [async () => { await beginBorrow(); }]);
++	}
++	harness = await createHarness({
++		tools: [], settings: { retry: { enabled: false }, compaction: { enabled: false } },
++		resourceLoader: createTestResourceLoader({ extensionsResult }),
++		toolInvocationPolicy: (request) => {
++			policies.push(`${request.caller.definition.name}->${request.target.definition.name}`);
++			return (request.caller.definition === owner && request.target.definition === target) ||
++				(request.caller.definition === peer && request.target.definition === probe);
++		},
++	});
++	const unsubscribe = harness.session.subscribe((event) => {
++		if (boundary === "session-listener" && event.type === "queue_update") void beginBorrow();
++	});
++	try {
++		await harness.session.bindExtensions({ mode: "print", onError: (error) => {
++			errors.push(error);
++			if (boundary === "error-listener" && error.event === "tool_execution_update" &&
++				error.error === "A2 synthetic update failure") void beginBorrow();
++		} });
++	} catch (error) {
++		peerFinished.resolve();
++		unsubscribe();
++		await Promise.allSettled(pending);
++		await harness.session.waitForIdle();
++		harness.cleanup();
++		throw error;
++	}
++	return {
++		harness, parallel, pending, faults, errors, effects, preparations, policies,
++		borrowEffects, borrowPreparations, borrowPolicies, borrowStates,
++		borrowedResults, ownerResults, peerResults, commandArguments,
++		release: peerFinished.resolve, unsubscribe,
++	};
++}
++
++type Fixture = Awaited<ReturnType<typeof fixture>>;
++
++function start(f: Fixture): Promise<void> {
++	const calls = [fauxToolCall("owner", {}, { id: "owner-root" })];
++	if (f.parallel) calls.push(fauxToolCall("peer", {}, { id: "peer-root" }));
++	f.harness.setResponses([
++		fauxAssistantMessage(calls, { stopReason: "toolUse" }),
++		fauxAssistantMessage("finished"),
++	]);
++	return f.harness.session.prompt("Exercise execution origins", { expandPromptTemplates: false });
++}
++
++async function settle(f: Fixture, prompt: Promise<void> | undefined) {
++	// Release first, including after a RED assertion; never remove a temp directory with work in flight.
++	f.release();
++	await Promise.allSettled(prompt ? [prompt] : []);
++	await Promise.allSettled(f.pending);
++	await f.harness.session.waitForIdle();
++	f.unsubscribe();
++	f.harness.cleanup();
++}
++
++function assertOwnerUse(f: Fixture) {
++	expect(f.ownerResults).toHaveLength(2);
++	expect(f.ownerResults[0]).toMatchObject({ isError: false, content: [{ type: "text", text: "target:owner" }] });
++	expect(f.ownerResults[1].isError).toBe(true);
++	expect(f.effects).toEqual(["owner"]);
++	expect(f.preparations).toEqual(["owner"]);
++	expect(f.policies.filter((name) => name === "owner->target")).toEqual(["owner->target"]);
++	expect(f.harness.getPendingResponseCount()).toBe(0);
++	expect(f.harness.session.messages.filter((message) => message.role === "assistant")).toHaveLength(2);
++}
++
++// Predictions are declared before execution. No new scope module, private fields, or fake dispatch.
++describe("AgentSession A2 invocation origins", () => {
++	for (const scenario of cases) {
++		it(`should reject borrowing from ${scenario.name}`, async () => {
++			const f = await fixture(scenario);
++			let prompt: Promise<void> | undefined;
++			try {
++				expect(f.harness.session.agent.toolExecution).toBe("parallel");
++				prompt = start(f);
++				await prompt;
++				await f.harness.session.waitForIdle();
++				expect(f.faults, "Callback setup and execution must not fail").toEqual([]);
++				expect(f.harness.eventsOfType("tool_execution_end").map((event) => event.isError), "Root executions must settle normally")
++					.toEqual(f.parallel ? [false, false] : [false]);
++				expect(f.errors.map(({ event, error }) => ({ event, error }))).toEqual(scenario.boundary === "error-listener"
++					? [{ event: "tool_execution_update", error: "A2 synthetic update failure" }] : []);
++				expect(f.borrowStates, "Callback must borrow the live unused owner, not an expired or consumed capability")
++					.toEqual([{ live: true, attempts: 0, peerLive: f.parallel }]);
++				if (scenario.boundary === "tool-call" || scenario.boundary === "tool-result") {
++					expect(f.peerResults).toHaveLength(1);
++					expect(f.peerResults[0]).toMatchObject({ isError: false, content: [{ type: "text", text: "probe completed" }] });
++				}
++				expect(f.commandArguments).toEqual(scenario.boundary === "command" ? ["origin-argument"] : []);
++
++				// First intended RED assertion: accepted A1 executes the borrowed target, yielding [["borrowed"]].
++				expect(f.borrowEffects, "A2 origin: unauthorized target effects").toEqual([[]]);
++				expect(f.borrowPreparations).toEqual([[]]);
++				expect(f.borrowPolicies).toEqual([[]]);
++				expect(f.borrowedResults).toHaveLength(1);
++				expect(f.borrowedResults[0].isError).toBe(true);
++				assertOwnerUse(f);
++				expect(f.harness.session.getToolInvocationRecords().filter((record) => record.callerName === "owner")
++					.map(({ status, execution }) => ({ status, execution }))).toEqual([
++					{ status: "denied", execution: "not-entered" },
++					{ status: "completed", execution: "entered" },
++					{ status: "denied", execution: "not-entered" },
++				]);
++			} finally {
++				await settle(f, prompt);
++			}
++		});
++	}
++
++	it("should retain rightful owner authority across ordinary awaits exactly once [A2-18]", async () => {
++		const f = await fixture({ name: "owner continuity", boundary: "owner-await", afterAwait: false });
++		let prompt: Promise<void> | undefined;
++		try {
++			prompt = start(f);
++			await prompt;
++			await f.harness.session.waitForIdle();
++			expect(f.faults).toEqual([]);
++			expect(f.errors).toEqual([]);
++			expect(f.borrowStates).toEqual([]);
++			assertOwnerUse(f);
++		} finally {
++			await settle(f, prompt);
++		}
++	});
++});
