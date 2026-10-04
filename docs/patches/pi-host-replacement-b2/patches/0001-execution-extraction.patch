@@ -1,0 +1,945 @@
+diff --git a/packages/agent/src/agent-loop.ts b/packages/agent/src/agent-loop.ts
+--- a/packages/agent/src/agent-loop.ts
++++ b/packages/agent/src/agent-loop.ts
+@@ -13,17 +13,21 @@
+ 	type ToolResultMessage,
+ 	type ToolStateChanges,
+ 	toToolDeclaration,
+-	validateToolArguments,
+ } from "@earendil-works/pi-ai";
+ import { getDefaultStreamFn } from "./stream-fn.ts";
++import {
++	createErrorToolResult,
++	executePreparedToolCall,
++	type FinalizedToolCallOutcome,
++	finalizeExecutedToolCall,
++	prepareToolCall,
++} from "./tool-execution.ts";
+ import type {
+ 	AgentContext,
+ 	AgentEvent,
+ 	AgentLoopConfig,
+ 	AgentMessage,
+-	AgentTool,
+ 	AgentToolCall,
+-	AgentToolResult,
+ 	PrepareNextTurnContext,
+ 	StreamFn,
+ } from "./types.ts";
+@@ -656,215 +660,10 @@
+ 	};
+ }
+ 
+-type PreparedToolCall = {
+-	kind: "prepared";
+-	toolCall: AgentToolCall;
+-	tool: AgentTool<any>;
+-	args: unknown;
+-};
+-
+-type ImmediateToolCallOutcome = {
+-	kind: "immediate";
+-	result: AgentToolResult<any>;
+-	isError: boolean;
+-};
+-
+-type ExecutedToolCallOutcome = {
+-	result: AgentToolResult<any>;
+-	isError: boolean;
+-};
+-
+-type FinalizedToolCallOutcome = {
+-	toolCall: AgentToolCall;
+-	result: AgentToolResult<any>;
+-	isError: boolean;
+-};
+-
+ type FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>);
+ 
+ function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
+ 	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);
+-}
+-
+-function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall): AgentToolCall {
+-	if (!tool.prepareArguments) {
+-		return toolCall;
+-	}
+-	const preparedArguments = tool.prepareArguments(toolCall.arguments);
+-	if (preparedArguments === toolCall.arguments) {
+-		return toolCall;
+-	}
+-	return {
+-		...toolCall,
+-		arguments: preparedArguments as Record<string, any>,
+-	};
+-}
+-
+-async function prepareToolCall(
+-	currentContext: AgentContext,
+-	assistantMessage: AssistantMessage,
+-	toolCall: AgentToolCall,
+-	config: AgentLoopConfig,
+-	signal: AbortSignal | undefined,
+-): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
+-	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
+-	if (!tool) {
+-		return {
+-			kind: "immediate",
+-			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+-			isError: true,
+-		};
+-	}
+-
+-	try {
+-		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
+-		const validatedArgs = validateToolArguments(tool, preparedToolCall);
+-		if (config.beforeToolCall) {
+-			const beforeResult = await config.beforeToolCall(
+-				{
+-					assistantMessage,
+-					toolCall,
+-					args: validatedArgs,
+-					context: currentContext,
+-				},
+-				signal,
+-			);
+-			if (signal?.aborted) {
+-				return {
+-					kind: "immediate",
+-					result: createErrorToolResult("Operation aborted"),
+-					isError: true,
+-				};
+-			}
+-			if (beforeResult?.block) {
+-				const result = createErrorToolResult(beforeResult.reason || "Tool execution was blocked");
+-				if (beforeResult.terminate === true) {
+-					result.terminate = true;
+-				}
+-				return {
+-					kind: "immediate",
+-					result,
+-					isError: true,
+-				};
+-			}
+-		}
+-		if (signal?.aborted) {
+-			return {
+-				kind: "immediate",
+-				result: createErrorToolResult("Operation aborted"),
+-				isError: true,
+-			};
+-		}
+-		return {
+-			kind: "prepared",
+-			toolCall,
+-			tool,
+-			args: validatedArgs,
+-		};
+-	} catch (error) {
+-		return {
+-			kind: "immediate",
+-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+-			isError: true,
+-		};
+-	}
+-}
+-
+-async function executePreparedToolCall(
+-	prepared: PreparedToolCall,
+-	signal: AbortSignal | undefined,
+-	emit: AgentEventSink,
+-): Promise<ExecutedToolCallOutcome> {
+-	const updateEvents: Promise<void>[] = [];
+-	let acceptingUpdates = true;
+-
+-	try {
+-		const result = await prepared.tool.execute(
+-			prepared.toolCall.id,
+-			prepared.args as never,
+-			signal,
+-			(partialResult) => {
+-				if (!acceptingUpdates) return;
+-				updateEvents.push(
+-					Promise.resolve(
+-						emit({
+-							type: "tool_execution_update",
+-							toolCallId: prepared.toolCall.id,
+-							toolName: prepared.toolCall.name,
+-							args: prepared.toolCall.arguments,
+-							partialResult,
+-						}),
+-					),
+-				);
+-			},
+-		);
+-		acceptingUpdates = false;
+-		await Promise.all(updateEvents);
+-		return { result, isError: false };
+-	} catch (error) {
+-		acceptingUpdates = false;
+-		await Promise.all(updateEvents);
+-		return {
+-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+-			isError: true,
+-		};
+-	} finally {
+-		acceptingUpdates = false;
+-	}
+-}
+-
+-async function finalizeExecutedToolCall(
+-	currentContext: AgentContext,
+-	assistantMessage: AssistantMessage,
+-	prepared: PreparedToolCall,
+-	executed: ExecutedToolCallOutcome,
+-	config: AgentLoopConfig,
+-	signal: AbortSignal | undefined,
+-): Promise<FinalizedToolCallOutcome> {
+-	let result = executed.result;
+-	let isError = executed.isError;
+-
+-	if (config.afterToolCall) {
+-		try {
+-			const afterResult = await config.afterToolCall(
+-				{
+-					assistantMessage,
+-					toolCall: prepared.toolCall,
+-					args: prepared.args,
+-					result,
+-					isError,
+-					context: currentContext,
+-				},
+-				signal,
+-			);
+-			if (afterResult) {
+-				result = {
+-					...result,
+-					content: afterResult.content ?? result.content,
+-					details: afterResult.details ?? result.details,
+-					usage: afterResult.usage ?? result.usage,
+-					terminate: afterResult.terminate ?? result.terminate,
+-				};
+-				isError = afterResult.isError ?? isError;
+-			}
+-		} catch (error) {
+-			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+-			isError = true;
+-		}
+-	}
+-
+-	return {
+-		toolCall: prepared.toolCall,
+-		result,
+-		isError,
+-	};
+-}
+-
+-function createErrorToolResult(message: string): AgentToolResult<any> {
+-	return {
+-		content: [{ type: "text", text: message }],
+-		details: {},
+-	};
+ }
+ 
+ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: AgentEventSink): Promise<void> {
+diff --git a/packages/agent/src/index.ts b/packages/agent/src/index.ts
+--- a/packages/agent/src/index.ts
++++ b/packages/agent/src/index.ts
+@@ -149,4 +149,13 @@
+ export * from "./proxy.ts";
+ export * from "./search/index.ts";
+ export { setDefaultStreamFn } from "./stream-fn.ts";
++export {
++	type ExecutedToolCallOutcome,
++	executePreparedToolCall,
++	type FinalizedToolCallOutcome,
++	finalizeExecutedToolCall,
++	type ImmediateToolCallOutcome,
++	type PreparedToolCall,
++	prepareToolCall,
++} from "./tool-execution.ts";
+ export * from "./types.ts";
+diff --git a/packages/agent/src/tool-execution.ts b/packages/agent/src/tool-execution.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/agent/src/tool-execution.ts
+@@ -0,0 +1,211 @@
++import { type AssistantMessage, validateToolArguments } from "@earendil-works/pi-ai";
++import type { AgentEventSink } from "./agent-loop.ts";
++import type { AgentContext, AgentLoopConfig, AgentTool, AgentToolCall, AgentToolResult } from "./types.ts";
++
++export type PreparedToolCall = {
++	kind: "prepared";
++	toolCall: AgentToolCall;
++	tool: AgentTool<any>;
++	args: unknown;
++};
++
++export type ImmediateToolCallOutcome = {
++	kind: "immediate";
++	result: AgentToolResult<any>;
++	isError: boolean;
++};
++
++export type ExecutedToolCallOutcome = {
++	result: AgentToolResult<any>;
++	isError: boolean;
++};
++
++export type FinalizedToolCallOutcome = {
++	toolCall: AgentToolCall;
++	result: AgentToolResult<any>;
++	isError: boolean;
++};
++
++function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall): AgentToolCall {
++	if (!tool.prepareArguments) {
++		return toolCall;
++	}
++	const preparedArguments = tool.prepareArguments(toolCall.arguments);
++	if (preparedArguments === toolCall.arguments) {
++		return toolCall;
++	}
++	return {
++		...toolCall,
++		arguments: preparedArguments as Record<string, any>,
++	};
++}
++
++/** Prepare and validate an assistant-origin call, then run its before hook. */
++export async function prepareToolCall(
++	currentContext: AgentContext,
++	assistantMessage: AssistantMessage,
++	toolCall: AgentToolCall,
++	config: AgentLoopConfig,
++	signal: AbortSignal | undefined,
++): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
++	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
++	if (!tool) {
++		return {
++			kind: "immediate",
++			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
++			isError: true,
++		};
++	}
++
++	try {
++		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
++		const validatedArgs = validateToolArguments(tool, preparedToolCall);
++		if (config.beforeToolCall) {
++			const beforeResult = await config.beforeToolCall(
++				{
++					assistantMessage,
++					toolCall,
++					args: validatedArgs,
++					context: currentContext,
++				},
++				signal,
++			);
++			if (signal?.aborted) {
++				return {
++					kind: "immediate",
++					result: createErrorToolResult("Operation aborted"),
++					isError: true,
++				};
++			}
++			if (beforeResult?.block) {
++				const result = createErrorToolResult(beforeResult.reason || "Tool execution was blocked");
++				if (beforeResult.terminate === true) {
++					result.terminate = true;
++				}
++				return {
++					kind: "immediate",
++					result,
++					isError: true,
++				};
++			}
++		}
++		if (signal?.aborted) {
++			return {
++				kind: "immediate",
++				result: createErrorToolResult("Operation aborted"),
++				isError: true,
++			};
++		}
++		return {
++			kind: "prepared",
++			toolCall,
++			tool,
++			args: validatedArgs,
++		};
++	} catch (error) {
++		return {
++			kind: "immediate",
++			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
++			isError: true,
++		};
++	}
++}
++
++/** Execute a prepared call and settle its accepted update events. */
++export async function executePreparedToolCall(
++	prepared: PreparedToolCall,
++	signal: AbortSignal | undefined,
++	emit: AgentEventSink,
++): Promise<ExecutedToolCallOutcome> {
++	const updateEvents: Promise<void>[] = [];
++	let acceptingUpdates = true;
++
++	try {
++		const result = await prepared.tool.execute(
++			prepared.toolCall.id,
++			prepared.args as never,
++			signal,
++			(partialResult) => {
++				if (!acceptingUpdates) return;
++				updateEvents.push(
++					Promise.resolve(
++						emit({
++							type: "tool_execution_update",
++							toolCallId: prepared.toolCall.id,
++							toolName: prepared.toolCall.name,
++							args: prepared.toolCall.arguments,
++							partialResult,
++						}),
++					),
++				);
++			},
++		);
++		acceptingUpdates = false;
++		await Promise.all(updateEvents);
++		return { result, isError: false };
++	} catch (error) {
++		acceptingUpdates = false;
++		await Promise.all(updateEvents);
++		return {
++			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
++			isError: true,
++		};
++	} finally {
++		acceptingUpdates = false;
++	}
++}
++
++/** Apply the after hook without emitting completion or transcript messages. */
++export async function finalizeExecutedToolCall(
++	currentContext: AgentContext,
++	assistantMessage: AssistantMessage,
++	prepared: PreparedToolCall,
++	executed: ExecutedToolCallOutcome,
++	config: AgentLoopConfig,
++	signal: AbortSignal | undefined,
++): Promise<FinalizedToolCallOutcome> {
++	let result = executed.result;
++	let isError = executed.isError;
++
++	if (config.afterToolCall) {
++		try {
++			const afterResult = await config.afterToolCall(
++				{
++					assistantMessage,
++					toolCall: prepared.toolCall,
++					args: prepared.args,
++					result,
++					isError,
++					context: currentContext,
++				},
++				signal,
++			);
++			if (afterResult) {
++				result = {
++					...result,
++					content: afterResult.content ?? result.content,
++					details: afterResult.details ?? result.details,
++					usage: afterResult.usage ?? result.usage,
++					terminate: afterResult.terminate ?? result.terminate,
++				};
++				isError = afterResult.isError ?? isError;
++			}
++		} catch (error) {
++			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
++			isError = true;
++		}
++	}
++
++	return {
++		toolCall: prepared.toolCall,
++		result,
++		isError,
++	};
++}
++
++export function createErrorToolResult(message: string): AgentToolResult<any> {
++	return {
++		content: [{ type: "text", text: message }],
++		details: {},
++	};
++}
+diff --git a/packages/agent/test/tool-execution.test.ts b/packages/agent/test/tool-execution.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/agent/test/tool-execution.test.ts
+@@ -0,0 +1,463 @@
++import {
++	type AssistantMessage,
++	type AssistantMessageEvent,
++	EventStream,
++	type Message,
++	type Model,
++	type Usage,
++} from "@earendil-works/pi-ai";
++import { Type } from "typebox";
++import { describe, expect, it } from "vitest";
++import { runAgentLoop } from "../src/agent-loop.ts";
++import {
++	type ExecutedToolCallOutcome,
++	executePreparedToolCall,
++	type FinalizedToolCallOutcome,
++	finalizeExecutedToolCall,
++	type ImmediateToolCallOutcome,
++	type PreparedToolCall,
++	prepareToolCall,
++} from "../src/index.ts";
++import type {
++	AgentContext,
++	AgentEvent,
++	AgentLoopConfig,
++	AgentTool,
++	AgentToolCall,
++	AgentToolResult,
++	AgentToolUpdateCallback,
++} from "../src/types.ts";
++
++const schema = Type.Object({ value: Type.String({ minLength: 1 }) });
++type TestTool = AgentTool<typeof schema, unknown>;
++
++function usage(input = 1): Usage {
++	return {
++		input,
++		output: 2,
++		cacheRead: 0,
++		cacheWrite: 0,
++		totalTokens: input + 2,
++		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++	};
++}
++
++function result(text = "done"): AgentToolResult<unknown> {
++	return { content: [{ type: "text", text }], details: { original: true }, usage: usage() };
++}
++
++function tool(overrides: Partial<TestTool> = {}): TestTool {
++	return {
++		name: "echo",
++		label: "Echo",
++		description: "In-process test tool",
++		parameters: schema,
++		execute: async () => result(),
++		...overrides,
++	};
++}
++
++function call(id = "first", value = "valid"): AgentToolCall {
++	return { type: "toolCall", id, name: "echo", arguments: { value } };
++}
++
++function assistant(calls: AgentToolCall[]): AssistantMessage {
++	return {
++		role: "assistant",
++		content: calls,
++		api: "openai-responses",
++		provider: "openai",
++		model: "mock",
++		usage: usage(0),
++		stopReason: calls.length ? "toolUse" : "stop",
++		timestamp: 1,
++	};
++}
++
++function config(overrides: Partial<AgentLoopConfig> = {}): AgentLoopConfig {
++	const model: Model<"openai-responses"> = {
++		id: "mock",
++		name: "mock",
++		api: "openai-responses",
++		provider: "openai",
++		baseUrl: "https://example.invalid",
++		reasoning: false,
++		input: ["text"],
++		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++		contextWindow: 8192,
++		maxTokens: 2048,
++	};
++	return {
++		model,
++		convertToLlm: (messages) => messages.filter((message): message is Message =>
++			message.role === "system" || message.role === "user" || message.role === "assistant" || message.role === "toolResult",
++		),
++		...overrides,
++	};
++}
++
++function deferred() {
++	let resolve!: () => void;
++	const promise = new Promise<void>((done) => {
++		resolve = done;
++	});
++	return { promise, resolve };
++}
++
++// This characterization uses the existing public loop before and after extraction.
++async function run(
++	tools: TestTool[],
++	calls = [call()],
++	overrides: Partial<AgentLoopConfig> = {},
++	signal?: AbortSignal,
++	onEvent?: (event: AgentEvent) => void | Promise<void>,
++) {
++	const events: AgentEvent[] = [];
++	const request = assistant(calls);
++	let requests = 0;
++	const messages = await runAgentLoop(
++		[{ role: "user", content: "exercise inline tools", timestamp: 0 }],
++		{ messages: [], tools },
++		config(overrides),
++		async (event) => {
++			events.push(event);
++			await onEvent?.(event);
++		},
++		signal,
++		() => {
++			const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
++				(event) => event.type === "done",
++				(event) => {
++					if (event.type !== "done") throw new Error("Expected done");
++					return event.message;
++				},
++			);
++			const message = requests++ === 0 ? request : assistant([]);
++			stream.push({ type: "done", reason: requests === 1 ? "toolUse" : "stop", message });
++			return stream;
++		},
++	);
++	return {
++		events, messages, requests, request,
++		results: messages.filter((message) => message.role === "toolResult"),
++		ends: events.filter((event) => event.type === "tool_execution_end"),
++	};
++}
++
++describe("tool pipeline through the public loop", () => {
++	it("should prepare before validation and expose original calls with mutable validated arguments", async () => {
++		const trace: unknown[] = [];
++		const raw = call();
++		raw.arguments = { legacy: "raw" };
++		const controller = new AbortController();
++		const observed = await run([tool({
++			prepareArguments: (args) => {
++				trace.push(["prepare", args]);
++				return { value: "prepared" };
++			},
++			execute: async (id, args, signal) => {
++				trace.push(["execute", id, args.value, signal]);
++				return result();
++			},
++		})], [raw], {
++			beforeToolCall: async ({ args, toolCall, assistantMessage }, signal) => {
++				trace.push(["before", structuredClone(args), toolCall === raw, assistantMessage.content[0] === raw, signal]);
++				(args as { value: string | number }).value = 123;
++				return undefined;
++			},
++			afterToolCall: async ({ args }) => { trace.push(["after", args]); return undefined; },
++		}, controller.signal, (event) => {
++			if (event.type === "tool_execution_start") trace.push(["start", event.args]);
++		});
++
++		expect(trace).toEqual([
++			["start", { legacy: "raw" }], ["prepare", { legacy: "raw" }],
++			["before", { value: "prepared" }, true, true, controller.signal],
++			["execute", "first", 123, controller.signal], ["after", { value: 123 }],
++		]);
++		expect(raw.arguments).toEqual({ legacy: "raw" });
++		expect(observed.results[0].isError).toBe(false);
++	});
++
++	it("should reject prepared arguments before either hook or execution", async () => {
++		const visited: string[] = [];
++		const observed = await run([tool({
++			prepareArguments: () => { visited.push("prepare"); return { value: "" }; },
++			execute: async () => { visited.push("execute"); return result(); },
++		})], [call()], {
++			beforeToolCall: async () => { visited.push("before"); return undefined; },
++			afterToolCall: async () => { visited.push("after"); return undefined; },
++		});
++		expect(visited).toEqual(["prepare"]);
++		expect(observed.results[0].isError).toBe(true);
++		expect(observed.results[0].content).toEqual([{ type: "text", text: expect.stringContaining("value") }]);
++		expect(observed.requests).toBe(2);
++	});
++
++	it("should normalize an unknown tool without invoking hooks", async () => {
++		const visited: string[] = [];
++		const observed = await run([], [call()], {
++			beforeToolCall: async () => { visited.push("before"); return undefined; },
++			afterToolCall: async () => { visited.push("after"); return undefined; },
++		});
++		expect(visited).toEqual([]);
++		expect(observed.results[0]).toMatchObject({ isError: true, content: [{ type: "text", text: "Tool echo not found" }], details: {} });
++	});
++
++	it.each([
++		["prepare", true], ["prepare", false], ["before", true], ["before", false],
++		["execute", true], ["execute", false], ["after", true], ["after", false],
++	] as const)("should normalize %s exceptions (Error=%s) without changing hook reachability", async (phase, errorObject) => {
++		const visited: string[] = [];
++		const visit = (step: string) => {
++			visited.push(step);
++			if (step === phase) throw errorObject ? new Error("failed here") : "failed here";
++		};
++		const observed = await run([tool({
++			prepareArguments: () => { visit("prepare"); return { value: "valid" }; },
++			execute: async () => { visit("execute"); return { ...result(), terminate: true }; },
++		})], [call()], {
++			beforeToolCall: async () => { visit("before"); return undefined; },
++			afterToolCall: async () => { visit("after"); return undefined; },
++		});
++		const expectedVisits = phase === "prepare" ? ["prepare"] : phase === "before" ? ["prepare", "before"] : ["prepare", "before", "execute", "after"];
++		expect(visited).toEqual(expectedVisits);
++		expect(observed.ends[0].result).toEqual({ content: [{ type: "text", text: "failed here" }], details: {} });
++		expect(observed.results[0].isError).toBe(true);
++		expect(observed.results[0].usage).toBeUndefined();
++		expect(observed.requests).toBe(2);
++	});
++
++	it.each([undefined, "denied"])("should skip execution and after hooks for a blocked call with reason %s", async (reason) => {
++		const visited: string[] = [];
++		const observed = await run([tool({ execute: async () => { visited.push("execute"); return result(); } })], [call()], {
++			beforeToolCall: async () => ({ block: true, reason, terminate: true }),
++			afterToolCall: async () => { visited.push("after"); return undefined; },
++		});
++		expect(visited).toEqual([]);
++		expect(observed.results[0].content).toEqual([{ type: "text", text: reason ?? "Tool execution was blocked" }]);
++		expect(observed.ends[0].result.terminate).toBe(true);
++		expect(observed.results[0]).not.toHaveProperty("terminate");
++		expect(observed.requests).toBe(1);
++	});
++
++	it("should replace after-hook fields without deep merging and recover an execution error", async () => {
++		const hookInputs: unknown[] = [];
++		const patched = { content: [], details: { replacement: true }, usage: usage(9), isError: false, terminate: true };
++		const observed = await run([tool({ execute: async () => { throw new Error("execution failed"); } })], [call()], {
++			afterToolCall: async ({ result: executed, isError, args }) => { hookInputs.push({ executed, isError, args }); return patched; },
++		});
++		expect(hookInputs).toEqual([{ executed: { content: [{ type: "text", text: "execution failed" }], details: {} }, isError: true, args: { value: "valid" } }]);
++		expect(observed.results[0]).toMatchObject({
++			content: [],
++			details: patched.details,
++			usage: patched.usage,
++			isError: false,
++		});
++		expect(observed.ends[0].result).toEqual({ content: [], details: patched.details, usage: patched.usage, terminate: true });
++		expect(observed.requests).toBe(1);
++	});
++
++	it("should preserve omitted fields and honor explicit false termination and error overrides", async () => {
++		const original = { ...result(), terminate: true };
++		const observed = await run([tool({ execute: async () => original })], [call()], {
++			afterToolCall: async () => ({ isError: true, terminate: false }),
++		});
++		expect(observed.ends[0].result).toEqual({ ...original, terminate: false });
++		expect(observed.results[0]).toMatchObject({ content: original.content, details: original.details, usage: original.usage, isError: true });
++		expect(observed.requests).toBe(2);
++	});
++
++	it("should normalize missing JS result content only at the transcript boundary", async () => {
++		// Deliberately emulate an untyped extension result; the runtime already tolerates this.
++		const malformed = { details: { original: true } } as AgentToolResult<unknown>;
++		const observed = await run([tool({ execute: async () => malformed })]);
++		expect(observed.ends[0].result).toBe(malformed);
++		expect(observed.ends[0].result).not.toHaveProperty("content");
++		expect(observed.results[0].content).toEqual([]);
++	});
++
++	it.each([false, true])("should settle updates before finalization and ignore late callbacks (throws=%s)", async (throws) => {
++		const updateSeen = deferred();
++		const releaseUpdate = deferred();
++		const trace: string[] = [];
++		let lateUpdate: AgentToolUpdateCallback<unknown> | undefined;
++		const running = run([tool({ execute: async (_id, _args, _signal, onUpdate) => {
++			lateUpdate = onUpdate;
++			onUpdate?.(result("progress"));
++			trace.push("execute-return");
++			if (throws) throw new Error("execution failed");
++			return result();
++		} })], [call()], {
++			afterToolCall: async () => { trace.push("after"); return undefined; },
++		}, undefined, async (event) => {
++			if (event.type === "tool_execution_update") {
++				trace.push("update"); updateSeen.resolve();
++				await releaseUpdate.promise;
++				trace.push("update-settled");
++			}
++			if (event.type === "tool_execution_end") trace.push("end");
++		});
++		await updateSeen.promise;
++		expect(trace).toEqual(["update", "execute-return"]);
++		releaseUpdate.resolve();
++		const observed = await running;
++		lateUpdate?.(result("too late"));
++		expect(trace).toEqual(["update", "execute-return", "update-settled", "after", "end"]);
++		expect(observed.events.filter((event) => event.type === "tool_execution_update")).toEqual([
++			{ type: "tool_execution_update", toolCallId: "first", toolName: "echo", args: { value: "valid" }, partialResult: result("progress") },
++		]);
++		expect(observed.results[0].isError).toBe(throws);
++	});
++
++	it.each(["sequential", "parallel"] as const)("should preserve %s preflight, completion, and source-ordered transcript pairing", async (mode) => {
++		const trace: string[] = [];
++		const releaseFirst = deferred();
++		const calls = [call("first"), call("denied"), call("last")];
++		const observed = await run([tool({ execute: async (id) => {
++			trace.push(`execute:${id}`);
++			if (mode === "parallel" && id === "first") await releaseFirst.promise;
++			return result(id);
++		} })], calls, {
++			toolExecution: mode,
++			beforeToolCall: async ({ toolCall }) => {
++				trace.push(`before:${toolCall.id}`);
++				return toolCall.id === "denied" ? { block: true } : undefined;
++			},
++			afterToolCall: async ({ toolCall }) => { trace.push(`after:${toolCall.id}`); return undefined; },
++		}, undefined, (event) => {
++			if (event.type === "tool_execution_start") trace.push(`start:${event.toolCallId}`);
++			if (event.type === "tool_execution_end") {
++				trace.push(`end:${event.toolCallId}`);
++				if (event.toolCallId === "last") releaseFirst.resolve();
++			}
++			if (event.type === "message_end" && event.message.role === "toolResult") trace.push(`message:${event.message.toolCallId}`);
++		});
++		expect(trace).toEqual(mode === "sequential" ? [
++			"start:first", "before:first", "execute:first", "after:first", "end:first", "message:first",
++			"start:denied", "before:denied", "end:denied", "message:denied",
++			"start:last", "before:last", "execute:last", "after:last", "end:last", "message:last",
++		] : [
++			"start:first", "before:first", "start:denied", "before:denied", "end:denied", "start:last", "before:last",
++			"execute:first", "execute:last", "after:last", "end:last", "after:first", "end:first",
++			"message:first", "message:denied", "message:last",
++		]);
++		expect(observed.results.map((message) => message.toolCallId)).toEqual(calls.map((entry) => entry.id));
++		expect(observed.events.filter((event) => event.type === "turn_end")[0].toolResults).toEqual(observed.results);
++		expect(observed.messages.indexOf(observed.request)).toBeLessThan(observed.messages.indexOf(observed.results[0]));
++	});
++
++	it.each(["sequential", "parallel"] as const)("should retain existing %s cancellation during preflight", async (mode) => {
++		const controller = new AbortController();
++		const executed: string[] = [];
++		const after: string[] = [];
++		const observed = await run([tool({ execute: async (id) => { executed.push(id); return result(); } })],
++			[call("first"), call("second"), call("unvisited")], {
++				toolExecution: mode,
++				beforeToolCall: async ({ toolCall }) => { if (toolCall.id === "second") controller.abort(); return undefined; },
++				afterToolCall: async ({ toolCall }) => {
++					after.push(toolCall.id);
++					return undefined;
++				},
++			}, controller.signal);
++		expect(executed).toEqual(mode === "sequential" ? ["first"] : []);
++		expect(after).toEqual(executed);
++		expect(observed.results.map((entry) => [entry.toolCallId, entry.isError])).toEqual([["first", mode === "parallel"], ["second", true]]);
++		expect(observed.results[1].content).toEqual([{ type: "text", text: "Operation aborted" }]);
++		expect(observed.ends.map((entry) => entry.toolCallId)).toEqual(mode === "sequential" ? ["first", "second"] : ["second", "first"]);
++	});
++
++	it("should still finalize a returned result when an executing tool aborts its signal", async () => {
++		const controller = new AbortController();
++		const signals: boolean[] = [];
++		const observed = await run([tool({ execute: async () => { controller.abort(); return result(); } })], [call()], {
++			afterToolCall: async (_context, signal) => { signals.push(signal?.aborted === true); return { usage: usage(7) }; },
++		}, controller.signal);
++		expect(signals).toEqual([true]);
++		expect(observed.results[0]).toMatchObject({ isError: false, content: result().content, usage: usage(7) });
++	});
++});
++
++// Direct export coverage is added only after the actual extraction exists.
++describe("public extracted tool phases", () => {
++	it("should carry an assistant-origin call through the real phases without transcript emission", async () => {
++		const raw = call();
++		const request = assistant([raw]);
++		const events: AgentEvent[] = [];
++		const hookInputs: unknown[] = [];
++		const controller = new AbortController();
++		const context: AgentContext = {
++			messages: [request],
++			tools: [tool({
++				execute: async (id, args, signal, onUpdate) => {
++					hookInputs.push(["execute", id, args.value, signal]);
++					onUpdate?.(result("progress"));
++					return result();
++				},
++			})],
++		};
++		const settings = config({
++			beforeToolCall: async ({ assistantMessage, toolCall, args, context: current }) => {
++				hookInputs.push(["before", assistantMessage === request, toolCall === raw, current === context]);
++				(args as { value: string }).value = "mutated";
++				return undefined;
++			},
++			afterToolCall: async ({ assistantMessage, args, result: executed, isError, context: current }) => {
++				hookInputs.push(["after", assistantMessage === request, args, executed, isError, current === context]);
++				return { usage: usage(8), terminate: true };
++			},
++		});
++
++		const prepared: PreparedToolCall | ImmediateToolCallOutcome = await prepareToolCall(
++			context, request, raw, settings, controller.signal,
++		);
++		expect(prepared.kind).toBe("prepared");
++		if (prepared.kind !== "prepared") throw new Error("Expected prepared call");
++		const executed: ExecutedToolCallOutcome = await executePreparedToolCall(
++			prepared, controller.signal, (event) => { events.push(event); },
++		);
++		const finalized: FinalizedToolCallOutcome = await finalizeExecutedToolCall(
++			context, request, prepared, executed, settings, controller.signal,
++		);
++
++		expect(hookInputs).toEqual([
++			["before", true, true, true],
++			["execute", "first", "mutated", controller.signal],
++			["after", true, { value: "mutated" }, result(), false, true],
++		]);
++		expect(finalized).toEqual({ toolCall: raw, result: { ...result(), usage: usage(8), terminate: true }, isError: false });
++		expect(context.messages).toEqual([request]);
++		expect(events).toEqual([{
++			type: "tool_execution_update",
++			toolCallId: raw.id,
++			toolName: raw.name,
++			args: raw.arguments,
++			partialResult: result("progress"),
++		}]);
++	});
++
++	it("should prioritize cancellation over a terminating denial after suspended preparation", async () => {
++		const entered = deferred();
++		const release = deferred();
++		const controller = new AbortController();
++		const raw = call();
++		const request = assistant([raw]);
++		const prepared = prepareToolCall({ messages: [request], tools: [tool()] }, request, raw, config({
++			beforeToolCall: async () => {
++				entered.resolve();
++				await release.promise;
++				return { block: true, reason: "denied", terminate: true };
++			},
++		}), controller.signal);
++
++		await entered.promise;
++		controller.abort();
++		release.resolve();
++
++		await expect(prepared).resolves.toEqual({
++			kind: "immediate",
++			result: { content: [{ type: "text", text: "Operation aborted" }], details: {} },
++			isError: true,
++		});
++	});
++});
