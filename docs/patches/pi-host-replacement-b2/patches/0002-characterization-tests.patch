@@ -1,0 +1,213 @@
+diff --git a/packages/agent/test/tool-execution.test.ts b/packages/agent/test/tool-execution.test.ts
+--- a/packages/agent/test/tool-execution.test.ts
++++ b/packages/agent/test/tool-execution.test.ts
+@@ -461,3 +461,111 @@
+ 		});
+ 	});
+ });
++
++// HP2-B1: captured on the existing public phases before origin-neutral factoring.
++describe("ordinary phase selection and accounting boundaries", () => {
++	it.each(["add", "replace", "remove"] as const)("should select the before hook after argument preparation (%s)", async (change) => {
++		const raw = call();
++		const request = assistant([raw]);
++		const signal = new AbortController().signal;
++		const visits: string[] = [];
++		const settings = config();
++		const context: AgentContext = { messages: [request], tools: [tool({
++			prepareArguments: () => {
++				settings.beforeToolCall = change === "remove" ? undefined : async function (this: AgentLoopConfig, input, receivedSignal) {
++					visits.push("selected");
++					expect(this).toBe(settings);
++					expect(input.assistantMessage).toBe(request);
++					expect(input.toolCall).toBe(raw);
++					expect(input.context).toBe(context);
++					expect(receivedSignal).toBe(signal);
++					(input.args as { value: string }).value = "mutated";
++					return undefined;
++				};
++				return { value: "prepared" };
++			},
++		})] };
++		if (change !== "add") settings.beforeToolCall = async () => { visits.push("stale"); return { block: true }; };
++
++		const prepared = await prepareToolCall(context, request, raw, settings, signal);
++
++		expect(visits).toEqual(change === "remove" ? [] : ["selected"]);
++		expect(prepared).toMatchObject({ kind: "prepared", args: { value: change === "remove" ? "prepared" : "mutated" } });
++		expect(raw.arguments).toEqual({ value: "valid" });
++	});
++
++	it("should retain ordinary hook getter presence checks and invocation receivers", async () => {
++		const raw = call();
++		const request = assistant([raw]);
++		const context: AgentContext = { messages: [request], tools: [tool()] };
++		const reads: string[] = [];
++		const settings = config();
++		Object.defineProperty(settings, "beforeToolCall", { get() {
++			reads.push("before");
++			return async function (this: AgentLoopConfig) { expect(this).toBe(settings); return undefined; };
++		} });
++		Object.defineProperty(settings, "afterToolCall", { get() {
++			reads.push("after");
++			return async function (this: AgentLoopConfig) { expect(this).toBe(settings); return undefined; };
++		} });
++		const prepared = await prepareToolCall(context, request, raw, settings, undefined);
++		if (prepared.kind !== "prepared") throw new Error("Expected prepared call");
++		const executed = { result: result(), isError: false };
++		const finalized = await finalizeExecutedToolCall(context, request, prepared, executed, settings, undefined);
++		expect(reads).toEqual(["before", "before", "after", "after"]);
++		expect(finalized.result).toBe(executed.result);
++	});
++
++	it.each([false, true])("should reject when an accepted update rejects even in execution catch (throws=%s)", async (throws) => {
++		const release = deferred();
++		const failure = new Error("update rejected");
++		const prepared: PreparedToolCall = { kind: "prepared", toolCall: call(), args: { value: "valid" }, tool: tool({
++			execute: async (_id, _args, _signal, update) => {
++				update?.(result("progress"));
++				if (throws) throw new Error("execution rejected");
++				return result();
++			},
++		}) };
++		const running = executePreparedToolCall(prepared, undefined, async () => {
++			await release.promise;
++			throw failure;
++		});
++		const checked = expect(running).rejects.toBe(failure);
++		// Let execute's await attach Promise.all before releasing the update rejection.
++		await Promise.resolve();
++		release.resolve();
++		await checked;
++	});
++
++	it("should discard prior usage and termination when the ordinary after hook rejects", async () => {
++		const raw = call();
++		const request = assistant([raw]);
++		const original = { ...result(), terminate: true };
++		const prepared: PreparedToolCall = { kind: "prepared", toolCall: raw, tool: tool(), args: raw.arguments };
++		const finalized = await finalizeExecutedToolCall({ messages: [request] }, request, prepared,
++			{ result: original, isError: false }, config({ afterToolCall: async () => { throw new Error("after rejected"); } }), undefined);
++		expect(finalized).toEqual({ toolCall: raw, result: { content: [{ type: "text", text: "after rejected" }], details: {} }, isError: true });
++		expect(original.usage).toEqual(usage());
++	});
++
++	it("should select the current after hook with the original result and validated argument references", async () => {
++		const raw = call();
++		const request = assistant([raw]);
++		const settings = config();
++		const original = result();
++		const context: AgentContext = { messages: [request], tools: [tool()] };
++		const prepared = await prepareToolCall(context, request, raw, settings, undefined);
++		if (prepared.kind !== "prepared") throw new Error("Expected prepared call");
++		settings.afterToolCall = async function (this: AgentLoopConfig, input) {
++			expect(this).toBe(settings);
++			expect(input.assistantMessage).toBe(request);
++			expect(input.context).toBe(context);
++			expect(input.toolCall).toBe(raw);
++			expect(input.args).toBe(prepared.args);
++			expect(input.result).toBe(original);
++			return { usage: usage(11), terminate: false };
++		};
++		const finalized = await finalizeExecutedToolCall(context, request, prepared, { result: original, isError: false }, settings, undefined);
++		expect(finalized.result).toEqual({ ...original, usage: usage(11), terminate: false });
++	});
++});
+diff --git a/packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts b/packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/coding-agent/test/suite/agent-session-tool-pipeline.test.ts
+@@ -0,0 +1,93 @@
++import { fauxAssistantMessage, fauxToolCall, type Usage } from "@earendil-works/pi-ai/compat";
++import { Type } from "typebox";
++import { describe, expect, it } from "vitest";
++import { AgentSession, type ExtensionFactory, type ToolResultEvent } from "../../src/index.ts";
++import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
++import { createHarness } from "./harness.ts";
++
++const toolUsage: Usage = {
++	input: 3, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 5,
++	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++};
++
++// Real AgentSession, registered tools and extension interception; only the model is faux.
++describe("ordinary AgentSession tool pipeline", () => {
++	it.each(["plain", "intercept", "deny", "error", "non-error", "result-error"] as const)(
++		"should preserve registered-tool transcript and interception behavior (%s)", async (mode) => {
++			const visits: string[] = [];
++			const results: ToolResultEvent[] = [];
++			const errors: string[] = [];
++			const factory: ExtensionFactory = (pi) => {
++				pi.registerTool({
++					name: "seam_echo", label: "Seam echo", description: "Synthetic text-only tool",
++					parameters: Type.Object({ value: Type.String() }),
++					prepareArguments: () => { visits.push("prepare"); return { value: "prepared" }; },
++					execute: async (_id, args) => {
++						visits.push(`execute:${args.value}`);
++						return { content: [{ type: "text", text: args.value }], details: { original: true }, usage: toolUsage };
++					},
++				});
++				if (mode === "plain") return;
++				pi.on("tool_call", (event) => {
++					visits.push("before");
++					expect(event.input).toEqual({ value: "prepared" });
++					if (mode === "deny") return { block: true, reason: "denied" };
++					if (mode === "error") throw new Error("before failed");
++					if (mode === "non-error") throw "before failed";
++					if (!("value" in event.input)) throw new Error("Expected synthetic value input");
++					event.input.value = "mutated";
++				});
++				pi.on("tool_result", (event) => {
++					visits.push("after");
++					results.push(event);
++					if (mode === "result-error") throw new Error("result handler failed");
++					return { content: [{ type: "text", text: "intercepted" }], details: { replacement: true }, isError: true };
++				});
++			};
++			// Explicit empty offline resources, no default tools or file-backed auth/settings/session.
++			const extensionsResult = await createTestExtensionsResult([factory]);
++			const harness = await createHarness({
++				tools: [], resourceLoader: createTestResourceLoader({ extensionsResult }),
++				settings: { retry: { enabled: false }, compaction: { enabled: false } },
++			});
++			try {
++				expect(harness.session).toBeInstanceOf(AgentSession);
++				expect(harness.session.getActiveToolNames()).toEqual(["seam_echo"]);
++				await harness.session.bindExtensions({ onError: (event) => { errors.push(event.error); } });
++				harness.setResponses([
++					fauxAssistantMessage(fauxToolCall("seam_echo", { value: "raw" }, { id: "seam-call" }), { stopReason: "toolUse" }),
++					fauxAssistantMessage("finished"),
++				]);
++
++				await harness.session.prompt("Exercise the synthetic tool", { expandPromptTemplates: false });
++				await harness.session.waitForIdle();
++
++				const denied = mode === "deny" || mode === "error" || mode === "non-error";
++				const text = mode === "plain" ? "prepared" : mode === "intercept" ? "intercepted" : mode === "deny" ? "denied"
++					: mode === "non-error" ? "Extension failed, blocking execution: before failed" : mode === "error" ? "before failed" : "mutated";
++				expect(visits).toEqual(mode === "plain" ? ["prepare", "execute:prepared"] : denied ? ["prepare", "before"] : ["prepare", "before", "execute:mutated", "after"]);
++				const messages = harness.session.messages.filter((message) => message.role !== "system");
++				expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult", "assistant"]);
++				const toolResults = harness.session.messages.filter((message) => message.role === "toolResult");
++				expect(toolResults).toHaveLength(1);
++				expect(toolResults[0]).toMatchObject({
++					toolCallId: "seam-call", toolName: "seam_echo", content: [{ type: "text", text }],
++					isError: denied || mode === "intercept",
++					details: denied ? {} : mode === "intercept" ? { replacement: true } : { original: true },
++				});
++				expect(toolResults[0].usage).toEqual(denied ? undefined : toolUsage);
++				expect(results).toHaveLength(denied || mode === "plain" ? 0 : 1);
++				if (results.length) expect(results[0]).toMatchObject({ input: { value: "mutated" }, content: [{ type: "text", text: "mutated" }], usage: toolUsage, isError: false });
++				expect(errors).toEqual(mode === "result-error" ? ["result handler failed"] : []);
++				expect(harness.eventsOfType("tool_execution_end")).toHaveLength(1);
++				expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
++				expect(harness.session.isIdle).toBe(true);
++				expect(harness.getPendingResponseCount()).toBe(0);
++				expect(harness.sessionManager.buildSessionContext().messages.filter((message) => message.role === "toolResult")).toEqual(toolResults);
++			} finally {
++				await harness.session.waitForIdle();
++				harness.cleanup();
++			}
++		},
++	);
++});
